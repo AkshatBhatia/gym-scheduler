@@ -1,9 +1,0 @@
-node_modules
-server/node_modules
-dashboard/node_modules
-server/data
-server/.env
-*.db
-*.db-wal
-*.db-shm
-.git

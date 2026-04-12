@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "install:all": "cd server && npm install && cd ../dashboard && npm install",
-    "build": "cd dashboard && npm run build && cd ../server && npm run build",
-    "start": "cd server && node dist/index.js",
-    "dev": "concurrently \"cd server && npm run dev\" \"cd dashboard && npm run dev\""
+    "build": "cd dashboard && npm install && ./node_modules/.bin/vite build && cd ../server && npm install && ./node_modules/.bin/tsc",
+    "start": "cd server && node dist/index.js"
+  },
+  "engines": {
+    "node": "20.x"
   }
 }
