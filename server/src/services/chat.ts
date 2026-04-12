@@ -598,6 +598,35 @@ KEY BEHAVIORS:
         },
       },
       {
+        name: "update_client_sessions",
+        description:
+          "Update a client's session balance. Use when a client purchases a new package or needs a balance adjustment.",
+        input_schema: {
+          type: "object" as const,
+          properties: {
+            clientName: {
+              type: "string",
+              description: "The client's name.",
+            },
+            sessions: {
+              type: "number",
+              description: "The new total session count to set, OR a positive number to add sessions.",
+            },
+            mode: {
+              type: "string",
+              description: "Either 'set' (set exact balance) or 'add' (add to current balance). Defaults to 'set'.",
+              enum: ["set", "add"],
+            },
+            packageType: {
+              type: "string",
+              description: "Optionally update the package type.",
+              enum: ["single", "5-pack", "10-pack", "20-pack", "monthly"],
+            },
+          },
+          required: ["clientName", "sessions"],
+        },
+      },
+      {
         name: "create_recurring_schedule",
         description:
           "Set up a recurring weekly appointment for a client. This creates the recurring rule and auto-generates appointments based on their remaining sessions.",
@@ -680,6 +709,14 @@ KEY BEHAVIORS:
         return this.toolSearchMessages(
           input.clientName as string | undefined,
           input.keyword as string | undefined
+        );
+
+      case "update_client_sessions":
+        return this.toolUpdateClientSessions(
+          input.clientName as string,
+          input.sessions as number,
+          (input.mode as string) || "set",
+          input.packageType as string | undefined
         );
 
       case "create_recurring_schedule":
@@ -1107,7 +1144,62 @@ KEY BEHAVIORS:
     });
   }
 
-  // Helper for public message flow
+  private async toolUpdateClientSessions(
+    clientName: string,
+    sessions: number,
+    mode: string,
+    packageType?: string
+  ): Promise<string> {
+    const allClients = db.select().from(clients).where(eq(clients.active, 1)).all();
+    const matched = allClients.find((c) =>
+      c.name.toLowerCase().includes(clientName.toLowerCase())
+    );
+    if (!matched) {
+      return JSON.stringify({ error: `No client found matching "${clientName}".` });
+    }
+
+    const currentBalance = matched.sessionsRemaining ?? 0;
+    const newBalance = mode === "add" ? currentBalance + sessions : sessions;
+
+    const updateData: Record<string, unknown> = {
+      sessionsRemaining: newBalance,
+      updatedAt: new Date().toISOString(),
+    };
+    if (packageType) {
+      updateData.packageType = packageType;
+    }
+
+    db.update(clients)
+      .set(updateData)
+      .where(eq(clients.id, matched.id))
+      .run();
+
+    // Log to session ledger
+    const change = newBalance - currentBalance;
+    if (change !== 0) {
+      db.insert(sessionLedger)
+        .values({
+          clientId: matched.id,
+          changeAmount: change,
+          balanceAfter: newBalance,
+          reason: mode === "add" ? "Sessions added" : "Balance updated",
+        })
+        .run();
+    }
+
+    // Auto-generate recurring appointments for the new balance
+    await generateForClient(matched.id);
+
+    return JSON.stringify({
+      success: true,
+      client: matched.name,
+      previousBalance: currentBalance,
+      newBalance,
+      packageType: packageType || matched.packageType,
+      message: `Updated ${matched.name}'s sessions from ${currentBalance} to ${newBalance}.${packageType ? ` Package: ${packageType}.` : ""}`,
+    });
+  }
+
   private async toolCreateRecurring(
     clientName: string,
     dayOfWeekStr: string,
