@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "build": "cd dashboard && npm install && ./node_modules/.bin/vite build && cd ../server && npm install && ./node_modules/.bin/tsc",
+    "build": "cd dashboard && npm install --include=dev && ./node_modules/.bin/vite build && cd ../server && npm install --include=dev && ./node_modules/.bin/tsc",
     "start": "cd server && node dist/index.js"
   },
   "engines": {
