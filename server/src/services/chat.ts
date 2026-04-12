@@ -598,6 +598,21 @@ KEY BEHAVIORS:
         },
       },
       {
+        name: "deactivate_client",
+        description:
+          "Deactivate (soft-delete) a client. Their data is kept but they won't appear in active lists.",
+        input_schema: {
+          type: "object" as const,
+          properties: {
+            clientName: {
+              type: "string",
+              description: "The client's name.",
+            },
+          },
+          required: ["clientName"],
+        },
+      },
+      {
         name: "update_client_sessions",
         description:
           "Update a client's session balance. Use when a client purchases a new package or needs a balance adjustment.",
@@ -710,6 +725,9 @@ KEY BEHAVIORS:
           input.clientName as string | undefined,
           input.keyword as string | undefined
         );
+
+      case "deactivate_client":
+        return this.toolDeactivateClient(input.clientName as string);
 
       case "update_client_sessions":
         return this.toolUpdateClientSessions(
@@ -1144,6 +1162,32 @@ KEY BEHAVIORS:
     });
   }
 
+  private async toolDeactivateClient(clientName: string): Promise<string> {
+    const allClients = db.select().from(clients).where(eq(clients.active, 1)).all();
+    const matched = allClients.find((c) =>
+      c.name.toLowerCase().includes(clientName.toLowerCase())
+    );
+    if (!matched) {
+      return JSON.stringify({ error: `No active client found matching "${clientName}".` });
+    }
+
+    db.update(clients)
+      .set({ active: 0, updatedAt: new Date().toISOString() })
+      .where(eq(clients.id, matched.id))
+      .run();
+
+    // Deactivate their recurring schedules too
+    db.update(recurringSchedules)
+      .set({ active: 0, updatedAt: new Date().toISOString() })
+      .where(eq(recurringSchedules.clientId, matched.id))
+      .run();
+
+    return JSON.stringify({
+      success: true,
+      message: `Deactivated ${matched.name}. They won't appear in active client lists. Their appointment history is preserved.`,
+    });
+  }
+
   private async toolUpdateClientSessions(
     clientName: string,
     sessions: number,
@@ -1260,12 +1304,30 @@ KEY BEHAVIORS:
       })
       .run();
 
-    // Auto-generate appointments based on sessions remaining
+    // Delete existing recurring appointments for this client and regenerate
+    // so all schedules get fair distribution of sessions
+    const existingRecurring = db
+      .select()
+      .from(appointments)
+      .where(
+        and(
+          eq(appointments.clientId, matched.id),
+          eq(appointments.status, "confirmed")
+        )
+      )
+      .all()
+      .filter((a) => a.recurringScheduleId != null && a.startTime > new Date().toISOString());
+
+    for (const appt of existingRecurring) {
+      db.delete(appointments).where(eq(appointments.id, appt.id)).run();
+    }
+
+    // Regenerate all recurring appointments with fair distribution
     const generated = await generateForClient(matched.id);
 
     return JSON.stringify({
       success: true,
-      message: `Created recurring ${dayOfWeekStr} at ${startTime} for ${matched.name}. Generated ${generated.created} upcoming appointments based on their ${matched.sessionsRemaining ?? 0} remaining sessions.`,
+      message: `Created recurring ${dayOfWeekStr} at ${startTime} for ${matched.name}. Generated ${generated.created} upcoming appointments across all recurring days based on their ${matched.sessionsRemaining ?? 0} remaining sessions.`,
     });
   }
 
