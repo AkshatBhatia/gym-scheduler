@@ -127,6 +127,16 @@ function insertClient(
     .get()!;
 }
 
+function insertAppointment(clientId: number) {
+  testDb.insert(schema.appointments).values({
+    clientId,
+    startTime: "2026-04-20T17:00:00.000Z",
+    endTime: "2026-04-20T18:00:00.000Z",
+    status: "confirmed",
+  }).run();
+  return testDb.select().from(schema.appointments).all().pop()!;
+}
+
 // ---------------------------------------------------------------------------
 // decrementSession
 // ---------------------------------------------------------------------------
@@ -137,7 +147,8 @@ describe("decrementSession", () => {
 
   it("decrements the session balance by 1", async () => {
     const client = insertClient({ sessionsRemaining: 5 });
-    const result = await decrementSession(client.id, 100);
+    const appt = insertAppointment(client.id);
+    const result = await decrementSession(client.id, appt.id);
 
     expect(result.success).toBe(true);
     expect(result.newBalance).toBe(4);
@@ -152,7 +163,8 @@ describe("decrementSession", () => {
 
   it("creates a ledger entry with changeAmount -1", async () => {
     const client = insertClient({ sessionsRemaining: 3 });
-    await decrementSession(client.id, 42);
+    const appt = insertAppointment(client.id);
+    await decrementSession(client.id, appt.id);
 
     const ledger = testDb
       .select()
@@ -163,13 +175,14 @@ describe("decrementSession", () => {
     expect(ledger).toHaveLength(1);
     expect(ledger[0].changeAmount).toBe(-1);
     expect(ledger[0].balanceAfter).toBe(2);
-    expect(ledger[0].appointmentId).toBe(42);
+    expect(ledger[0].appointmentId).toBe(appt.id);
     expect(ledger[0].reason).toBe("Session completed");
   });
 
   it("clamps balance to 0 when already at 0", async () => {
     const client = insertClient({ sessionsRemaining: 0 });
-    const result = await decrementSession(client.id, 1);
+    const appt = insertAppointment(client.id);
+    const result = await decrementSession(client.id, appt.id);
 
     expect(result.success).toBe(true);
     expect(result.newBalance).toBe(0);
@@ -179,7 +192,8 @@ describe("decrementSession", () => {
     const client = insertClient({
       sessionsRemaining: null as unknown as number,
     });
-    const result = await decrementSession(client.id, 1);
+    const appt = insertAppointment(client.id);
+    const result = await decrementSession(client.id, appt.id);
 
     expect(result.success).toBe(true);
     expect(result.newBalance).toBe(0);

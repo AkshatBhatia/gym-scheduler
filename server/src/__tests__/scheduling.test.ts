@@ -16,23 +16,14 @@ vi.mock("../db/index.js", () => {
   };
 });
 
-// Also mock timezone to avoid settings table issues
+// Mock timezone — treat all times as UTC (no conversion) for simplicity
 vi.mock("../services/timezone.js", () => ({
-  getTimezone: () => "America/Los_Angeles",
-  localToUTC: (iso: string) => {
-    // Simple mock: treat input as Pacific, add 7 hours
-    const d = new Date(iso);
-    d.setHours(d.getHours() + 7);
-    return d.toISOString();
-  },
-  utcToLocal: (iso: string) => iso,
+  getTimezone: () => "UTC",
+  localToUTC: (iso: string) => new Date(iso).toISOString(),
+  utcToLocal: (iso: string) => iso.replace(/\.000Z$/, "").replace(/Z$/, ""),
   todayLocal: () => new Date().toISOString().slice(0, 10),
   formatLocalTimeShort: (iso: string) => iso,
-  localDateTimeToUTC: (date: string, time: string) => {
-    const d = new Date(`${date}T${time}:00`);
-    d.setHours(d.getHours() + 7);
-    return d.toISOString();
-  },
+  localDateTimeToUTC: (date: string, time: string) => new Date(`${date}T${time}:00Z`).toISOString(),
 }));
 
 // Now import services (they'll use mocked db)
@@ -86,9 +77,11 @@ describe("Scheduling Service", () => {
 
   describe("bookAppointment", () => {
     const futureTime = () => {
+      // Next Monday at 10am UTC (within Mon-Sat 6am-6pm window)
       const d = new Date();
-      d.setDate(d.getDate() + 7);
-      d.setHours(17, 0, 0, 0); // 10am Pacific in UTC
+      const daysUntilMon = ((1 - d.getDay()) + 7) % 7 || 7;
+      d.setDate(d.getDate() + daysUntilMon);
+      d.setUTCHours(10, 0, 0, 0);
       return d.toISOString();
     };
 
