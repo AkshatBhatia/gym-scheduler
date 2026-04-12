@@ -1,7 +1,7 @@
 import { Router, Request, Response } from "express";
 import { eq, and } from "drizzle-orm";
 import db from "../db/index.js";
-import { recurringSchedules, clients } from "../db/schema.js";
+import { recurringSchedules, clients, appointments } from "../db/schema.js";
 import { generateForClient, generateAllRecurring } from "../services/recurring.js";
 
 const router = Router();
@@ -98,7 +98,25 @@ router.post("/", async (req: Request, res: Response) => {
       .returning()
       .get();
 
-    // Auto-generate appointments based on client's remaining sessions
+    // Delete existing future recurring appointments so generateForClient
+    // redistributes sessions fairly across ALL schedules (including new one)
+    const now = new Date().toISOString();
+    const futureRecurring = db
+      .select()
+      .from(appointments)
+      .where(
+        and(
+          eq(appointments.clientId, clientId),
+          eq(appointments.status, "confirmed")
+        )
+      )
+      .all()
+      .filter((a) => a.recurringScheduleId != null && a.startTime > now);
+
+    for (const appt of futureRecurring) {
+      db.delete(appointments).where(eq(appointments.id, appt.id)).run();
+    }
+
     const generated = await generateForClient(clientId);
 
     res.status(201).json({ schedule: result, generated });
