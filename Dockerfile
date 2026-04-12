@@ -1,15 +1,13 @@
-FROM node:20
+FROM node:20.18-bookworm
 
 WORKDIR /app
-
-# Copy everything (node_modules excluded via .dockerignore)
 COPY . .
 
 # Install and build dashboard
-RUN cd dashboard && npm ci && ./node_modules/.bin/vite build
+RUN cd dashboard && npm install --no-audit --no-fund && ./node_modules/.bin/vite build
 
 # Install and build server
-RUN cd server && npm ci && ./node_modules/.bin/tsc
+RUN cd server && npm install --no-audit --no-fund && ./node_modules/.bin/tsc
 
 # Clean up dev dependencies
 RUN cd server && npm prune --production
