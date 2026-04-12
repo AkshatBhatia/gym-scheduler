@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import path from "path";
 
 // Import database to ensure it initializes
 import "./db/index.js";
@@ -55,9 +56,19 @@ app.get("/api/health", (_req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-// 404 handler
-app.use((_req, res) => {
-  res.status(404).json({ error: "Not found" });
+// Serve dashboard static files in production
+const dashboardPath = path.join(process.cwd(), "../dashboard/dist");
+app.use(express.static(dashboardPath));
+
+// SPA fallback — serve index.html for any non-API route
+app.use((req, res, next) => {
+  if (req.path.startsWith("/api/")) {
+    res.status(404).json({ error: "Not found" });
+  } else {
+    res.sendFile(path.join(dashboardPath, "index.html"), (err) => {
+      if (err) next();
+    });
+  }
 });
 
 // Global error handler

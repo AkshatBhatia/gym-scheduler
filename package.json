@@ -1,0 +1,11 @@
+{
+  "name": "gymflow",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "install:all": "cd server && npm install && cd ../dashboard && npm install",
+    "build": "cd dashboard && npm run build && cd ../server && npm run build",
+    "start": "cd server && node dist/index.js",
+    "dev": "concurrently \"cd server && npm run dev\" \"cd dashboard && npm run dev\""
+  }
+}
