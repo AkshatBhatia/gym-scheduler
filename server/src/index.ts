@@ -1,4 +1,7 @@
 import "dotenv/config";
+import { runMigrations } from "./db/migrate.js";
+runMigrations();
+
 import express from "express";
 import cors from "cors";
 import path from "path";
