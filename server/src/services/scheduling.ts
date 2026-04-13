@@ -212,7 +212,8 @@ export async function getAvailableSlots(date: string): Promise<TimeSlot[]> {
 export async function bookAppointment(
   clientId: number,
   startTime: string,
-  notes?: string
+  notes?: string,
+  opts?: { clientInitiated?: boolean }
 ): Promise<{ success: boolean; appointment?: typeof appointments.$inferSelect; error?: string; warning?: string }> {
   // Validate client exists
   const client = db
@@ -241,6 +242,29 @@ export async function bookAppointment(
   // BUG FIX #2: Always use full ISO with Z suffix for consistent UTC storage
   const normalizedStart = startDate.toISOString();
   const endTimeISO = endDate.toISOString();
+
+  // One appointment per day per client (client-initiated only)
+  if (opts?.clientInitiated) {
+    const bookingDate = normalizedStart.slice(0, 10); // YYYY-MM-DD in UTC
+    const dayStart = bookingDate + "T00:00:00.000Z";
+    const dayEnd = bookingDate + "T23:59:59.999Z";
+    const sameDayAppts = db
+      .select()
+      .from(appointments)
+      .where(
+        and(
+          eq(appointments.clientId, clientId),
+          eq(appointments.status, "confirmed"),
+          gte(appointments.startTime, dayStart),
+          lte(appointments.startTime, dayEnd)
+        )
+      )
+      .all();
+
+    if (sameDayAppts.length > 0) {
+      return { success: false, error: "You already have an appointment on this day. Please pick a different date or cancel your existing appointment first." };
+    }
+  }
 
   // BUG FIX #3: Reject bookings in the past
   if (startDate.getTime() < Date.now()) {
@@ -433,7 +457,8 @@ export async function markNoShow(
 export async function rescheduleAppointment(
   appointmentId: number,
   newStartTime: string,
-  notes?: string
+  notes?: string,
+  opts?: { clientInitiated?: boolean }
 ): Promise<{ success: boolean; appointment?: typeof appointments.$inferSelect; error?: string }> {
   const existing = db
     .select()
@@ -463,6 +488,30 @@ export async function rescheduleAppointment(
   // Past check
   if (newStart.getTime() < Date.now()) {
     return { success: false, error: "Cannot reschedule to a time in the past" };
+  }
+
+  // One appointment per day per client (client-initiated only)
+  if (opts?.clientInitiated) {
+    const newDate = normalizedStart.slice(0, 10);
+    const dayStart = newDate + "T00:00:00.000Z";
+    const dayEnd = newDate + "T23:59:59.999Z";
+    const sameDayAppts = db
+      .select()
+      .from(appointments)
+      .where(
+        and(
+          eq(appointments.clientId, existing.clientId),
+          eq(appointments.status, "confirmed"),
+          ne(appointments.id, appointmentId), // exclude the one being rescheduled
+          gte(appointments.startTime, dayStart),
+          lte(appointments.startTime, dayEnd)
+        )
+      )
+      .all();
+
+    if (sameDayAppts.length > 0) {
+      return { success: false, error: "You already have an appointment on this day. Please pick a different date." };
+    }
   }
 
   // Double-booking check — date-bounded, exclude the appointment being rescheduled

@@ -31,6 +31,15 @@ Any new tool must enforce all of them.
   3. **Not blocked** — no `isBlocked=1` override covers the slot.
 - If any check fails, the operation must fail and the original state must be unchanged (atomic).
 
+### One appointment per day per client (client-initiated)
+
+When a **client** books or reschedules via chat/SMS, they are limited to **one confirmed appointment per calendar day**. This is enforced at the service layer for client-initiated actions:
+- `book_appointment` — reject if client already has a confirmed appointment on that date.
+- `reschedule_appointment` — reject if the new date already has a confirmed appointment (excluding the one being rescheduled).
+- `create_recurring_schedule` — reject if two recurring slots would land on the same day of the week.
+
+The **instructor can override this** via their own tools (e.g., scheduling a double session day). The check only applies when the request originates from the client.
+
 ### Atomicity — no partial creates
 
 All appointment creation operations must be **all-or-nothing**:

@@ -7,6 +7,7 @@ import {
   sessionLedger,
   messages,
   recurringSchedules,
+  instructor,
 } from "../db/schema.js";
 import { generateForClient, listRecurringSchedules, updateRecurringSchedule, deleteRecurringSchedule } from "./recurring.js";
 import { eq, and, gte, lte, like, desc, sql } from "drizzle-orm";
@@ -19,7 +20,7 @@ import {
   localToUTC,
 } from "./timezone.js";
 import { bookAppointment, cancelAppointment, completeAppointment, markNoShow, rescheduleAppointment, skipRecurringInstance, getAvailableSlots } from "./scheduling.js";
-import { listClients, updateClient, reactivateClient, deleteClient } from "./clients.js";
+import { listClients, updateClient, reactivateClient, deleteClient, updateMyContact } from "./clients.js";
 import { setAvailability, listAvailability, overrideAvailability, removeBlock } from "./availability.js";
 import { getDailySummary, getWeeklySummary } from "./dashboard.js";
 import { sendMessageToClient } from "./messaging.js";
@@ -59,6 +60,22 @@ export class ChatAgent {
       await sendSms(phone, body);
     } catch (e) {
       console.error(`[SMS] Failed to send to ${phone}:`, e);
+    }
+
+    // Store the message in the messages table for the Messages tab
+    try {
+      const client = db.select().from(clients).where(eq(clients.phone, phone)).get();
+      db.insert(messages)
+        .values({
+          clientId: client?.id ?? null,
+          direction: "outbound",
+          channel: "sms",
+          senderType: "system",
+          body,
+        })
+        .run();
+    } catch (e) {
+      // Storage failure should not block the operation
     }
   }
 
@@ -252,7 +269,14 @@ export class ChatAgent {
     const tz = getTimezone();
     const history = this.getConversationHistory(clientPhone, client.id, 20);
     const clientTools = this.getTools().filter((t) =>
-      ["get_available_slots", "book_appointment", "cancel_appointment", "list_appointments", "create_recurring_schedule"].includes(t.name)
+      [
+        "get_available_slots", "book_appointment", "cancel_appointment",
+        "list_appointments", "create_recurring_schedule",
+        "reschedule_appointment", "list_recurring_schedules",
+        "skip_recurring_instance", "delete_recurring_schedule",
+        "get_my_info", "get_session_balance",
+        "update_my_contact", "get_payment_info",
+      ].includes(t.name)
     );
 
     // Get all future appointments for this client to provide context
@@ -279,12 +303,23 @@ Today is ${todayLocal()}. Timezone: ${tz}.
 Their upcoming appointments:
 ${upcomingList}
 
-You CAN book, cancel, and check available slots for this client using the tools provided.
-When booking, use "${client.name}" as the clientName.
+You CAN help this client with:
+- Book, cancel, reschedule appointments
+- Check available slots
+- View and manage their recurring schedules (list, skip weeks, cancel)
+- Check their session balance and account info
+- Get payment info (Venmo link)
+- Update their email or phone
+
+When using tools, pass "${client.name}" as the clientName.
 Keep responses brief and text-message friendly.
 IMPORTANT: All times are in ${tz}. Pass local times to tools.
 
-IMPORTANT BOOKING RULE: Before confirming a new booking, ALWAYS use list_appointments to check if the client already has another appointment on the SAME DAY. If they do, ask them to confirm: "You already have a session at [time] that day. Do you want to keep both appointments?" Do NOT book until they confirm.
+IMPORTANT RULES:
+- This client can only have ONE appointment per day. If they try to book a second one on the same day, the system will reject it.
+- Before confirming a new booking, use list_appointments to check for same-day conflicts.
+- When a client cancels, offer alternative slots for rebooking.
+- When asked about sessions/balance, proactively mention if balance is low (≤ 2) and include payment info.
 
 CRITICAL — NEVER ASSUME, ALWAYS VERIFY:
 - After any booking or cancellation, call list_appointments to verify it actually happened before confirming to the client.
@@ -304,7 +339,14 @@ CRITICAL — NEVER ASSUME, ALWAYS VERIFY:
       messages: aiMessages,
     });
 
-    // Agentic tool-use loop (same as instructor)
+    // Agentic tool-use loop (client-initiated: enforce one-per-day)
+    const MUTATION_TOOLS = new Set([
+      "book_appointment", "cancel_appointment", "reschedule_appointment",
+      "create_recurring_schedule", "skip_recurring_instance", "delete_recurring_schedule",
+      "update_my_contact",
+    ]);
+    const instructorPhone = process.env.INSTRUCTOR_PHONE_NUMBER;
+
     while (response.stop_reason === "tool_use") {
       const assistantContent = response.content;
       aiMessages.push({ role: "assistant", content: assistantContent });
@@ -314,13 +356,27 @@ CRITICAL — NEVER ASSUME, ALWAYS VERIFY:
         if (block.type === "tool_use") {
           const result = await this.executeTool(
             block.name,
-            block.input as Record<string, unknown>
+            block.input as Record<string, unknown>,
+            { clientInitiated: true }
           );
           toolResults.push({
             type: "tool_result",
             tool_use_id: block.id,
             content: result,
           });
+
+          // Notify instructor of client-initiated mutations
+          if (instructorPhone && MUTATION_TOOLS.has(block.name)) {
+            try {
+              const parsed = JSON.parse(result);
+              if (parsed.success) {
+                await this.trySendSms(
+                  instructorPhone,
+                  `[Client action] ${client.name}: ${parsed.message || block.name}`
+                );
+              }
+            } catch { /* result parse failure — skip notification */ }
+          }
         }
       }
 
@@ -1013,12 +1069,41 @@ CRITICAL RULES — VIOLATIONS CAUSE REAL-WORLD HARM:
           required: ["clientName", "body"],
         },
       },
+      // --- Client-only tools ---
+      {
+        name: "get_my_info",
+        description: "Get the client's own profile: name, phone, email, package, sessions remaining, upcoming appointments, and recurring schedules.",
+        input_schema: {
+          type: "object" as const,
+          properties: {},
+        },
+      },
+      {
+        name: "update_my_contact",
+        description: "Update the client's own email or phone number. Cannot change name.",
+        input_schema: {
+          type: "object" as const,
+          properties: {
+            email: { type: "string", description: "New email address." },
+            phone: { type: "string", description: "New phone number in E.164 format." },
+          },
+        },
+      },
+      {
+        name: "get_payment_info",
+        description: "Get payment information: session balance and how to purchase more sessions (Venmo link).",
+        input_schema: {
+          type: "object" as const,
+          properties: {},
+        },
+      },
     ];
   }
 
   private async executeTool(
     name: string,
-    input: Record<string, unknown>
+    input: Record<string, unknown>,
+    opts?: { clientInitiated?: boolean }
   ): Promise<string> {
     switch (name) {
       case "list_appointments":
@@ -1029,7 +1114,8 @@ CRITICAL RULES — VIOLATIONS CAUSE REAL-WORLD HARM:
           input.clientName as string,
           input.dateTime as string,
           (input.duration as number) || 60,
-          input.notes as string | undefined
+          input.notes as string | undefined,
+          opts?.clientInitiated
         );
 
       case "cancel_appointment":
@@ -1100,7 +1186,8 @@ CRITICAL RULES — VIOLATIONS CAUSE REAL-WORLD HARM:
       case "reschedule_appointment":
         return this.toolReschedule(
           input.appointmentId as number,
-          input.newDateTime as string
+          input.newDateTime as string,
+          opts?.clientInitiated
         );
 
       case "list_recurring_schedules":
@@ -1171,6 +1258,20 @@ CRITICAL RULES — VIOLATIONS CAUSE REAL-WORLD HARM:
           input.body as string
         );
 
+      // --- Client-only tools ---
+      case "get_my_info":
+        return this.toolGetMyInfo(input.clientName as string);
+
+      case "update_my_contact":
+        return this.toolUpdateMyContact(
+          input.clientName as string | undefined,
+          input.email as string | undefined,
+          input.phone as string | undefined
+        );
+
+      case "get_payment_info":
+        return this.toolGetPaymentInfo(input.clientName as string | undefined);
+
       default:
         return JSON.stringify({ error: `Unknown tool: ${name}` });
     }
@@ -1233,7 +1334,8 @@ CRITICAL RULES — VIOLATIONS CAUSE REAL-WORLD HARM:
     clientName: string,
     dateTime: string,
     duration: number,
-    notes?: string
+    notes?: string,
+    clientInitiated?: boolean
   ): Promise<string> {
     // Find client by name (case-insensitive partial match)
     const { client: matchedClient, error } = this.resolveClient(clientName);
@@ -1243,7 +1345,7 @@ CRITICAL RULES — VIOLATIONS CAUSE REAL-WORLD HARM:
     const startUTC = localToUTC(dateTime);
 
     // Delegate to scheduling service (handles past check, availability, conflicts, UTC format)
-    const result = await bookAppointment(matchedClient!.id, startUTC, notes);
+    const result = await bookAppointment(matchedClient!.id, startUTC, notes, { clientInitiated });
     if (!result.success) {
       return JSON.stringify({ error: result.error });
     }
@@ -1273,7 +1375,7 @@ CRITICAL RULES — VIOLATIONS CAUSE REAL-WORLD HARM:
       client: matchedClient!.name,
       start: appt.startTime,
       end: appt.endTime,
-      formatted: `Booked ${matchedClient!.name} for ${startFormatted}.${sessionInfo}`,
+      formatted: `Booked ${matchedClient!.name} for ${dateStr} at ${startFormatted}.${sessionInfo}`,
       _verify: "Call list_appointments for this date to confirm the booking exists.",
     });
   }
@@ -1331,7 +1433,7 @@ CRITICAL RULES — VIOLATIONS CAUSE REAL-WORLD HARM:
 
     return JSON.stringify({
       success: true,
-      message: `Cancelled ${appt.clientName}'s appointment on ${formatLocalTimeShort(appt.startTime)}.${refundInfo}`,
+      message: `Cancelled ${appt.clientName}'s appointment on ${utcToLocal(appt.startTime).slice(0, 10)} at ${formatLocalTimeShort(appt.startTime)}.${refundInfo}`,
       _verify: "Call list_appointments to confirm the cancellation.",
     });
   }
@@ -1815,21 +1917,25 @@ CRITICAL RULES — VIOLATIONS CAUSE REAL-WORLD HARM:
       return JSON.stringify({ error: result.error });
     }
 
-    // Check if balance went negative — warn instructor
+    // Build a descriptive message with client name + date/time
     const appt = db.select().from(appointments).where(eq(appointments.id, appointmentId)).get();
+    let desc = `appointment #${appointmentId}`;
     if (appt) {
       const client = db.select().from(clients).where(eq(clients.id, appt.clientId)).get();
+      const localStart = utcToLocal(appt.startTime);
+      desc = `${client?.name || "Client"}'s ${localStart.slice(0, 10)} at ${formatLocalTimeShort(appt.startTime)} appointment`;
+
       if (client && (client.sessionsRemaining ?? 0) <= 0) {
         return JSON.stringify({
           success: true,
           warning: `${client.name} has ${client.sessionsRemaining} sessions remaining. They need to purchase more.`,
-          message: `Marked appointment #${appointmentId} as completed.`,
+          message: `Marked ${desc} as completed.`,
           _verify: "Call list_appointments to confirm the status change.",
         });
       }
     }
 
-    return JSON.stringify({ success: true, message: `Marked appointment #${appointmentId} as completed.`, _verify: "Call list_appointments to confirm the status change." });
+    return JSON.stringify({ success: true, message: `Marked ${desc} as completed.`, _verify: "Call list_appointments to confirm the status change." });
   }
 
   private async toolMarkNoShow(appointmentId: number, deductSession: boolean): Promise<string> {
@@ -1852,14 +1958,17 @@ CRITICAL RULES — VIOLATIONS CAUSE REAL-WORLD HARM:
     }
 
     const deductMsg = deductSession ? " Session deducted." : " No session deducted.";
+    const noShowDesc = appt
+      ? `${appt.clientName}'s ${utcToLocal(appt.startTime).slice(0, 10)} at ${formatLocalTimeShort(appt.startTime)} appointment`
+      : `appointment #${appointmentId}`;
     return JSON.stringify({
       success: true,
-      message: `Marked appointment #${appointmentId} as no-show.${deductMsg}`,
+      message: `Marked ${noShowDesc} as no-show.${deductMsg}`,
       _verify: "Call list_appointments to confirm the status change.",
     });
   }
 
-  private async toolReschedule(appointmentId: number, newDateTime: string): Promise<string> {
+  private async toolReschedule(appointmentId: number, newDateTime: string, clientInitiated?: boolean): Promise<string> {
     // Look up original appointment for SMS
     const original = db
       .select({ clientId: appointments.clientId, startTime: appointments.startTime, clientName: clients.name, clientPhone: clients.phone })
@@ -1869,7 +1978,7 @@ CRITICAL RULES — VIOLATIONS CAUSE REAL-WORLD HARM:
       .get();
 
     const newStartUTC = localToUTC(newDateTime);
-    const result = await rescheduleAppointment(appointmentId, newStartUTC);
+    const result = await rescheduleAppointment(appointmentId, newStartUTC, undefined, { clientInitiated });
     if (!result.success) {
       return JSON.stringify({ error: result.error });
     }
@@ -1887,7 +1996,7 @@ CRITICAL RULES — VIOLATIONS CAUSE REAL-WORLD HARM:
     return JSON.stringify({
       success: true,
       appointmentId: result.appointment!.id,
-      message: `Rescheduled to ${formatLocalTimeShort(result.appointment!.startTime)}.`,
+      message: `Rescheduled ${original?.clientName || "appointment"} from ${original ? utcToLocal(original.startTime).slice(0, 10) + " at " + formatLocalTimeShort(original.startTime) : "old time"} to ${utcToLocal(result.appointment!.startTime).slice(0, 10)} at ${formatLocalTimeShort(result.appointment!.startTime)}.`,
       _verify: "Call list_appointments for the new date to confirm the reschedule.",
     });
   }
@@ -1952,7 +2061,9 @@ CRITICAL RULES — VIOLATIONS CAUSE REAL-WORLD HARM:
       );
     }
 
-    return JSON.stringify({ success: true, message: `Updated recurring schedule #${scheduleId}.`, _verify: "Call list_recurring_schedules to confirm the update." });
+    const newDay = dayOfWeekStr || oldDay;
+    const newTime = startTime || oldTime;
+    return JSON.stringify({ success: true, message: `Updated ${clientBefore?.name || "client"}'s recurring from ${oldDay}s at ${oldTime} to ${newDay}s at ${newTime}.`, _verify: "Call list_recurring_schedules to confirm the update." });
   }
 
   private async toolDeleteRecurring(scheduleId: number): Promise<string> {
@@ -1975,7 +2086,10 @@ CRITICAL RULES — VIOLATIONS CAUSE REAL-WORLD HARM:
       );
     }
 
-    return JSON.stringify({ success: true, message: `Deleted recurring schedule #${scheduleId} and cancelled future appointments.`, _verify: "Call list_recurring_schedules to confirm deletion." });
+    const delDesc = client && schedule
+      ? `Deleted ${client.name}'s recurring ${DAY_NAMES[schedule.dayOfWeek]} at ${schedule.startTime} and cancelled future appointments.`
+      : `Deleted recurring schedule #${scheduleId} and cancelled future appointments.`;
+    return JSON.stringify({ success: true, message: delDesc, _verify: "Call list_recurring_schedules to confirm deletion." });
   }
 
   private async toolSkipRecurring(
@@ -1997,14 +2111,14 @@ CRITICAL RULES — VIOLATIONS CAUSE REAL-WORLD HARM:
       const localStart = utcToLocal(startTime);
       await this.trySendSms(
         matched!.phone,
-        `Your session on ${localStart.slice(0, 10)} has been cancelled. Your recurring schedule continues as normal after that.`
+        `Your session on ${localStart.slice(0, 10)} at ${localStart.slice(11, 16)} has been cancelled. Your recurring schedule continues as normal after that.`
       );
     }
 
     return JSON.stringify({
       success: true,
       skipped: result.skipped,
-      message: `Skipped ${result.skipped} week(s) for ${matched!.name}.`,
+      message: `Skipped ${result.skipped} week(s) for ${matched!.name}: ${result.cancelledStartTimes.map(t => utcToLocal(t).slice(0, 10)).join(", ")}.`,
       _verify: "Call list_appointments to confirm the skipped weeks.",
     });
   }
@@ -2188,6 +2302,131 @@ CRITICAL RULES — VIOLATIONS CAUSE REAL-WORLD HARM:
     }
 
     return JSON.stringify({ success: true, message: `Message sent to ${matched!.name}.` });
+  }
+
+  // --- Client-only tool handlers ---
+
+  private async toolGetMyInfo(clientName: string): Promise<string> {
+    const { client: matched, error } = this.resolveClient(clientName, { includeInactive: true });
+    if (error) return JSON.stringify({ error });
+
+    // Upcoming appointments
+    const now = new Date().toISOString();
+    const upcoming = db
+      .select()
+      .from(appointments)
+      .where(
+        and(
+          eq(appointments.clientId, matched!.id),
+          eq(appointments.status, "confirmed"),
+          gte(appointments.startTime, now)
+        )
+      )
+      .all()
+      .sort((a, b) => a.startTime.localeCompare(b.startTime))
+      .slice(0, 10);
+
+    // Recurring schedules
+    const schedules = await listRecurringSchedules(matched!.id);
+
+    // Session ledger (recent)
+    const ledger = db
+      .select()
+      .from(sessionLedger)
+      .where(eq(sessionLedger.clientId, matched!.id))
+      .orderBy(desc(sessionLedger.createdAt))
+      .limit(5)
+      .all();
+
+    return JSON.stringify({
+      name: matched!.name,
+      phone: matched!.phone,
+      email: matched!.email,
+      packageType: matched!.packageType,
+      sessionsRemaining: matched!.sessionsRemaining,
+      upcomingAppointments: upcoming.map((a) => ({
+        id: a.id,
+        start: utcToLocal(a.startTime),
+        end: utcToLocal(a.endTime),
+        notes: a.notes,
+      })),
+      recurringSchedules: schedules.map((s) => ({
+        id: s.id,
+        day: DAY_NAMES[s.dayOfWeek],
+        startTime: s.startTime,
+        endTime: s.endTime,
+        active: s.active === 1,
+      })),
+      recentActivity: ledger.map((l) => ({
+        change: l.changeAmount,
+        balance: l.balanceAfter,
+        reason: l.reason,
+        date: l.createdAt,
+      })),
+    });
+  }
+
+  private async toolUpdateMyContact(
+    clientName: string | undefined,
+    email?: string,
+    phone?: string
+  ): Promise<string> {
+    if (!clientName) return JSON.stringify({ error: "Client name required." });
+    const { client: matched, error } = this.resolveClient(clientName);
+    if (error) return JSON.stringify({ error });
+
+    if (!email && !phone) {
+      return JSON.stringify({ error: "Provide at least an email or phone to update." });
+    }
+
+    const result = await updateMyContact(matched!.id, { email, phone });
+    if (!result.success) {
+      return JSON.stringify({ error: result.error });
+    }
+
+    // Notify instructor
+    const instructorPhone = process.env.INSTRUCTOR_PHONE_NUMBER;
+    if (instructorPhone) {
+      const fields = [email && "email", phone && "phone"].filter(Boolean).join(" and ");
+      await this.trySendSms(instructorPhone, `${matched!.name} updated their ${fields}.`);
+    }
+
+    const updatedMsg = phone
+      ? `Contact updated. You'll receive messages at your new number going forward.`
+      : `Contact updated.`;
+
+    return JSON.stringify({
+      success: true,
+      message: updatedMsg,
+      _verify: "Call get_my_info to confirm the update.",
+    });
+  }
+
+  private async toolGetPaymentInfo(clientName?: string): Promise<string> {
+    // Get instructor Venmo handle
+    const inst = db.select().from(instructor).get();
+    const venmoHandle = inst?.venmoHandle || null;
+
+    if (clientName) {
+      const { client: matched, error } = this.resolveClient(clientName);
+      if (error) return JSON.stringify({ error });
+
+      return JSON.stringify({
+        sessionsRemaining: matched!.sessionsRemaining,
+        packageType: matched!.packageType,
+        venmoHandle,
+        message: venmoHandle
+          ? `You have ${matched!.sessionsRemaining ?? 0} sessions remaining. To purchase more, Venmo: ${venmoHandle}. Your trainer will update your balance once payment is received.`
+          : `You have ${matched!.sessionsRemaining ?? 0} sessions remaining. Please contact your trainer to purchase more sessions.`,
+      });
+    }
+
+    return JSON.stringify({
+      venmoHandle,
+      message: venmoHandle
+        ? `To purchase sessions, Venmo: ${venmoHandle}. Your trainer will update your balance.`
+        : `Please contact your trainer to purchase sessions.`,
+    });
   }
 }
 

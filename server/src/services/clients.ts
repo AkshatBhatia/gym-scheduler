@@ -103,6 +103,51 @@ export async function reactivateClient(
 }
 
 /**
+ * Update a client's own contact info (email, phone).
+ * Clients cannot change their own name — instructor does that.
+ */
+export async function updateMyContact(
+  clientId: number,
+  updates: { email?: string; phone?: string }
+): Promise<{ success: boolean; error?: string }> {
+  const existing = db
+    .select()
+    .from(clients)
+    .where(eq(clients.id, clientId))
+    .get();
+
+  if (!existing) {
+    return { success: false, error: "Client not found" };
+  }
+
+  // Check for duplicate phone
+  if (updates.phone && updates.phone !== existing.phone) {
+    const dupe = db
+      .select()
+      .from(clients)
+      .where(eq(clients.phone, updates.phone))
+      .get();
+
+    if (dupe) {
+      return { success: false, error: "This phone number is already in use" };
+    }
+  }
+
+  const { email, phone } = updates;
+
+  db.update(clients)
+    .set({
+      ...(email !== undefined && { email }),
+      ...(phone !== undefined && { phone }),
+      updatedAt: new Date().toISOString(),
+    })
+    .where(eq(clients.id, clientId))
+    .run();
+
+  return { success: true };
+}
+
+/**
  * Permanently delete a client and all their related data.
  * Cascade: cancel future appointments → delete recurring schedules →
  * delete session ledger → delete messages → delete all appointments → delete client.
