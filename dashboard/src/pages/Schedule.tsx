@@ -9,14 +9,14 @@ import {
   getHours,
   getMinutes,
 } from 'date-fns';
-import { getWeekAppointments, createAppointment, updateAppointmentStatus, getAvailability } from '../api';
+import { getWeekAppointments, createAppointment, updateAppointmentStatus, deleteAppointment, getAvailability } from '../api';
 import type { Appointment, AvailabilityRule } from '../types';
 import StatusBadge from '../components/StatusBadge';
 import BookingModal from '../components/BookingModal';
 import Modal from '../components/Modal';
 
-const HOURS = Array.from({ length: 13 }, (_, i) => i + 6); // 6am-6pm
-const DAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const HOURS = Array.from({ length: 24 }, (_, i) => i); // 0am-11pm (full 24 hours)
+const DAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
 const STATUS_BG: Record<Appointment['status'], string> = {
   confirmed: 'bg-blue-100 border-blue-300 text-blue-800',
@@ -46,7 +46,7 @@ export default function Schedule() {
   });
 
   const days = useMemo(
-    () => Array.from({ length: 6 }, (_, i) => addDays(weekStart, i)),
+    () => Array.from({ length: 7 }, (_, i) => addDays(weekStart, i)),
     [weekStart]
   );
 
@@ -61,6 +61,14 @@ export default function Schedule() {
   const statusMutation = useMutation({
     mutationFn: ({ id, status }: { id: number; status: Appointment['status'] }) =>
       updateAppointmentStatus(id, status),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['week-appointments'] });
+      setSelected(null);
+    },
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: (id: number) => deleteAppointment(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['week-appointments'] });
       setSelected(null);
@@ -105,7 +113,7 @@ export default function Schedule() {
             &larr; Prev
           </button>
           <span className="text-sm font-semibold text-gray-700">
-            {format(weekStart, 'MMM d')} &mdash; {format(addDays(weekStart, 5), 'MMM d, yyyy')}
+            {format(weekStart, 'MMM d')} &mdash; {format(addDays(weekStart, 6), 'MMM d, yyyy')}
           </span>
           <button
             onClick={() => setWeekStart((d) => addDays(d, 7))}
@@ -126,7 +134,7 @@ export default function Schedule() {
       <div className="overflow-x-auto rounded-xl border border-gray-200 bg-white shadow-sm">
         <div className="min-w-[800px]">
           {/* Day headers */}
-          <div className="grid grid-cols-[80px_repeat(6,1fr)] border-b border-gray-200">
+          <div className="grid grid-cols-[80px_repeat(7,1fr)] border-b border-gray-200">
             <div className="border-r border-gray-200 p-2" />
             {days.map((day, i) => (
               <div
@@ -151,7 +159,7 @@ export default function Schedule() {
           {HOURS.map((hour) => (
             <div
               key={hour}
-              className="grid grid-cols-[80px_repeat(6,1fr)] border-b border-gray-100 last:border-b-0"
+              className="grid grid-cols-[80px_repeat(7,1fr)] border-b border-gray-100 last:border-b-0"
             >
               <div className="flex items-start justify-end border-r border-gray-200 p-2 text-xs font-medium text-gray-400">
                 {format(new Date(2000, 0, 1, hour), 'h a')}
@@ -257,6 +265,20 @@ export default function Schedule() {
                   </button>
                 ))}
               </div>
+            </div>
+
+            <div className="border-t border-gray-200 pt-4">
+              <button
+                onClick={() => {
+                  if (confirm('Permanently delete this appointment? This cannot be undone.')) {
+                    deleteMutation.mutate(selected.id);
+                  }
+                }}
+                disabled={deleteMutation.isPending}
+                className="rounded-lg border border-red-300 px-4 py-2 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-40"
+              >
+                {deleteMutation.isPending ? 'Deleting...' : 'Delete Appointment'}
+              </button>
             </div>
           </div>
         )}

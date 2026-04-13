@@ -340,4 +340,32 @@ router.put("/:id/status", async (req: Request, res: Response) => {
   }
 });
 
+// DELETE /api/appointments/:id — permanently delete an appointment
+router.delete("/:id", (req: Request, res: Response) => {
+  try {
+    const id = parseInt(String(req.params.id), 10);
+    if (isNaN(id)) {
+      res.status(400).json({ error: "Invalid appointment ID" });
+      return;
+    }
+
+    const existing = db
+      .select()
+      .from(appointments)
+      .where(eq(appointments.id, id))
+      .get();
+
+    if (!existing) {
+      res.status(404).json({ error: "Appointment not found" });
+      return;
+    }
+
+    db.delete(appointments).where(eq(appointments.id, id)).run();
+    res.json({ message: "Appointment deleted" });
+  } catch (error) {
+    console.error("Error deleting appointment:", error);
+    res.status(500).json({ error: "Failed to delete appointment" });
+  }
+});
+
 export default router;

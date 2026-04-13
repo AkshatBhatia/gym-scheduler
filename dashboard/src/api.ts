@@ -94,6 +94,10 @@ export function updateAppointmentStatus(
   });
 }
 
+export function deleteAppointment(id: number): Promise<void> {
+  return request(`/appointments/${id}`, { method: 'DELETE' });
+}
+
 // ── Availability ─────────────────────────────────────────
 
 export function getAvailability(): Promise<AvailabilityRule[]> {
