@@ -56,26 +56,31 @@ export async function verifyOTP(
 ): Promise<{ success: boolean; token?: string; instructor?: any; isNewUser?: boolean; error?: string }> {
   const now = new Date().toISOString();
 
+  // Dev bypass: accept "12345" as a valid OTP in non-production
+  const isDevBypass = process.env.NODE_ENV !== "production" && code === "12345";
+
   // Find a valid, unused OTP for this phone
-  const otp = db
-    .select()
-    .from(otpCodes)
-    .where(
-      and(
-        eq(otpCodes.phone, phone),
-        eq(otpCodes.code, code),
-        eq(otpCodes.used, 0),
-        gte(otpCodes.expiresAt, now)
-      )
-    )
-    .get();
+  const otp = isDevBypass
+    ? { id: 0, phone, code, expiresAt: "", used: 0, createdAt: "" }
+    : db
+        .select()
+        .from(otpCodes)
+        .where(
+          and(
+            eq(otpCodes.phone, phone),
+            eq(otpCodes.code, code),
+            eq(otpCodes.used, 0),
+            gte(otpCodes.expiresAt, now)
+          )
+        )
+        .get();
 
   if (!otp) {
     return { success: false, error: "Invalid or expired code" };
   }
 
-  // Mark OTP as used
-  db.update(otpCodes)
+  // Mark OTP as used (skip for dev bypass)
+  if (!isDevBypass) db.update(otpCodes)
     .set({ used: 1 })
     .where(eq(otpCodes.id, otp.id))
     .run();
