@@ -297,13 +297,13 @@ describe("availability change cascading", () => {
     });
 
     it("cancels appointments outside narrowed hours", async () => {
-      // Appointment at 7am Monday (within current 06:00-18:00)
+      // Appointment at 7am on a future Monday (within current 06:00-18:00)
       testDb.db.insert(schema.appointments).values({
-        clientId: 1, startTime: "2026-04-13T07:00:00.000Z", endTime: "2026-04-13T08:00:00.000Z", status: "confirmed",
+        clientId: 1, startTime: "2026-04-20T07:00:00.000Z", endTime: "2026-04-20T08:00:00.000Z", status: "confirmed",
       }).run();
-      // Appointment at 10am Monday (within new hours too)
+      // Appointment at 10am on same future Monday (within new hours too)
       testDb.db.insert(schema.appointments).values({
-        clientId: 2, startTime: "2026-04-13T10:00:00.000Z", endTime: "2026-04-13T11:00:00.000Z", status: "confirmed",
+        clientId: 2, startTime: "2026-04-20T10:00:00.000Z", endTime: "2026-04-20T11:00:00.000Z", status: "confirmed",
       }).run();
 
       // Narrow Monday to 09:00-17:00 (was 06:00-18:00)
@@ -335,7 +335,7 @@ describe("availability change cascading", () => {
 
     it("does NOT deduct sessions for cascaded cancellations", async () => {
       testDb.db.insert(schema.appointments).values({
-        clientId: 1, startTime: "2026-04-13T07:00:00.000Z", endTime: "2026-04-13T08:00:00.000Z", status: "confirmed",
+        clientId: 1, startTime: "2026-04-20T07:00:00.000Z", endTime: "2026-04-20T08:00:00.000Z", status: "confirmed",
       }).run();
 
       const before = testDb.db.select().from(schema.clients).where(eq(schema.clients.id, 1)).get()!;
@@ -349,8 +349,8 @@ describe("availability change cascading", () => {
 
     it("sends SMS to each affected client", async () => {
       testDb.db.insert(schema.appointments).values([
-        { clientId: 1, startTime: "2026-04-13T07:00:00.000Z", endTime: "2026-04-13T08:00:00.000Z", status: "confirmed" },
-        { clientId: 2, startTime: "2026-04-13T07:30:00.000Z", endTime: "2026-04-13T08:30:00.000Z", status: "confirmed" },
+        { clientId: 1, startTime: "2026-04-20T07:00:00.000Z", endTime: "2026-04-20T08:00:00.000Z", status: "confirmed" },
+        { clientId: 2, startTime: "2026-04-20T07:30:00.000Z", endTime: "2026-04-20T08:30:00.000Z", status: "confirmed" },
       ]).run();
 
       await setAvailability([

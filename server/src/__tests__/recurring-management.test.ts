@@ -193,11 +193,11 @@ describe("delete_recurring_schedule", () => {
     // Future recurring appointments
     testDb.db.insert(schema.appointments).values([
       {
-        clientId: 1, startTime: "2026-04-13T09:00:00.000Z", endTime: "2026-04-13T10:00:00.000Z",
+        clientId: 1, startTime: "2026-04-20T09:00:00.000Z", endTime: "2026-04-20T10:00:00.000Z",
         status: "confirmed", recurringScheduleId: 1,
       },
       {
-        clientId: 1, startTime: "2026-04-20T09:00:00.000Z", endTime: "2026-04-20T10:00:00.000Z",
+        clientId: 1, startTime: "2026-04-27T09:00:00.000Z", endTime: "2026-04-27T10:00:00.000Z",
         status: "confirmed", recurringScheduleId: 1,
       },
     ]).run();

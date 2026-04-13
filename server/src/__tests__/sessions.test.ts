@@ -54,6 +54,7 @@ function createTestDb() {
       day_of_week INTEGER NOT NULL,
       start_time TEXT NOT NULL,
       end_time TEXT NOT NULL,
+      end_date TEXT,
       active INTEGER DEFAULT 1,
       notes TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,

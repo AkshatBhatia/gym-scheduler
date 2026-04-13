@@ -138,7 +138,7 @@ export class ChatAgent {
     ];
 
     let response = await this.anthropic.messages.create({
-      model: "claude-sonnet-4-20250514",
+      model: "claude-opus-4-6",
       max_tokens: 4096,
       system: systemPrompt,
       tools,
@@ -168,7 +168,7 @@ export class ChatAgent {
       messages.push({ role: "user", content: toolResults });
 
       response = await this.anthropic.messages.create({
-        model: "claude-sonnet-4-20250514",
+        model: "claude-opus-4-6",
         max_tokens: 4096,
         system: systemPrompt,
         tools,
@@ -284,7 +284,12 @@ When booking, use "${client.name}" as the clientName.
 Keep responses brief and text-message friendly.
 IMPORTANT: All times are in ${tz}. Pass local times to tools.
 
-IMPORTANT BOOKING RULE: Before confirming a new booking, ALWAYS use list_appointments to check if the client already has another appointment on the SAME DAY. If they do, ask them to confirm: "You already have a session at [time] that day. Do you want to keep both appointments?" Do NOT book until they confirm.`;
+IMPORTANT BOOKING RULE: Before confirming a new booking, ALWAYS use list_appointments to check if the client already has another appointment on the SAME DAY. If they do, ask them to confirm: "You already have a session at [time] that day. Do you want to keep both appointments?" Do NOT book until they confirm.
+
+CRITICAL — NEVER ASSUME, ALWAYS VERIFY:
+- After any booking or cancellation, call list_appointments to verify it actually happened before confirming to the client.
+- If a tool returns an error, tell the client exactly what went wrong. Do not make up a success message.
+- When asked about appointment status, ALWAYS call the tool. Never rely on memory from earlier in the conversation.`;
 
     const aiMessages: Anthropic.MessageParam[] = [
       ...history,
@@ -292,7 +297,7 @@ IMPORTANT BOOKING RULE: Before confirming a new booking, ALWAYS use list_appoint
     ];
 
     let response = await this.anthropic.messages.create({
-      model: "claude-sonnet-4-20250514",
+      model: "claude-opus-4-6",
       max_tokens: 1024,
       system: systemPrompt,
       tools: clientTools,
@@ -322,7 +327,7 @@ IMPORTANT BOOKING RULE: Before confirming a new booking, ALWAYS use list_appoint
       aiMessages.push({ role: "user", content: toolResults });
 
       response = await this.anthropic.messages.create({
-        model: "claude-sonnet-4-20250514",
+        model: "claude-opus-4-6",
         max_tokens: 1024,
         system: systemPrompt,
         tools: clientTools,
@@ -444,7 +449,24 @@ KEY BEHAVIORS:
 - If something is ambiguous, ask a clarifying question rather than guessing.
 - For dates, interpret relative references like "tomorrow", "next Monday", etc. relative to today's date.
 - Default appointment duration is 1 hour unless specified otherwise.
-- IMPORTANT: All times the user mentions are in ${tz}. When calling tools that take dateTime params, pass the LOCAL time as ISO format (e.g., 2026-04-08T15:00:00). The system will handle UTC conversion.`;
+- IMPORTANT: All times the user mentions are in ${tz}. When calling tools that take dateTime params, pass the LOCAL time as ISO format (e.g., 2026-04-08T15:00:00). The system will handle UTC conversion.
+
+CRITICAL RULES — VIOLATIONS CAUSE REAL-WORLD HARM:
+
+1. ONLY STATE FACTS FROM TOOL RESPONSES. Never infer, assume, or fill in details the tool did not return. If a tool says "cancelled 11 appointments", say exactly that — do not add "Friday appointments should still be intact" unless a tool confirmed it.
+
+2. AFTER EVERY MUTATION, YOU MUST CALL A READ TOOL BEFORE RESPONDING. This is mandatory, not optional.
+   - After set_availability → call list_availability to confirm what was actually set
+   - After book_appointment → call list_appointments to confirm the booking exists
+   - After create_recurring_schedule → call list_recurring_schedules AND list_appointments to confirm
+   - After cancel/reschedule → call list_appointments to confirm the new state
+   Do NOT respond to the user until you have read back and confirmed the state.
+
+3. NEVER ANSWER STATE QUESTIONS FROM MEMORY. If asked "does Umang have appointments?", call list_appointments. If asked "what are my hours?", call list_availability. Every. Single. Time.
+
+4. REPORT ONLY WHAT THE TOOL RETURNED. Do not add commentary like "X should still be intact" or "Y was probably cancelled". If you're unsure about something, call a tool to check rather than guessing.
+
+5. IF A TOOL RETURNS AN ERROR, report the exact error message. Do not rephrase it or soften it.`;
   }
 
   private getTools(): Anthropic.Tool[] {
@@ -679,7 +701,7 @@ KEY BEHAVIORS:
       {
         name: "create_recurring_schedule",
         description:
-          "Set up a recurring weekly appointment for a client. This creates the recurring rule and auto-generates appointments based on their remaining sessions.",
+          "Set up one or more recurring weekly appointments for a client. ATOMIC: if multiple slots are requested, ALL must have availability or the entire operation fails. Pass all desired day/time pairs in a single call.",
         input_schema: {
           type: "object" as const,
           properties: {
@@ -687,25 +709,35 @@ KEY BEHAVIORS:
               type: "string",
               description: "The client's name.",
             },
-            dayOfWeek: {
-              type: "string",
-              description: "Day of the week (e.g., 'Monday', 'Tuesday', 'Friday').",
-              enum: ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
-            },
-            startTime: {
-              type: "string",
-              description: "Start time in HH:MM format (24-hour), e.g., '08:00', '14:00'.",
-            },
-            endTime: {
-              type: "string",
-              description: "End time in HH:MM format (24-hour). Defaults to 1 hour after start.",
+            slots: {
+              type: "array",
+              description: "Array of recurring slots to create. All must pass availability checks or none are created.",
+              items: {
+                type: "object",
+                properties: {
+                  dayOfWeek: {
+                    type: "string",
+                    description: "Day of the week.",
+                    enum: ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
+                  },
+                  startTime: {
+                    type: "string",
+                    description: "Start time in HH:MM format (24-hour).",
+                  },
+                  endTime: {
+                    type: "string",
+                    description: "End time in HH:MM format (24-hour). Defaults to 1 hour after start.",
+                  },
+                },
+                required: ["dayOfWeek", "startTime"],
+              },
             },
             endDate: {
               type: "string",
               description: "Optional end date for the recurring schedule in YYYY-MM-DD format. If not provided, recurring continues until sessions run out.",
             },
           },
-          required: ["clientName", "dayOfWeek", "startTime"],
+          required: ["clientName", "slots"],
         },
       },
       {
@@ -1052,9 +1084,7 @@ KEY BEHAVIORS:
       case "create_recurring_schedule":
         return this.toolCreateRecurring(
           input.clientName as string,
-          input.dayOfWeek as string,
-          input.startTime as string,
-          input.endTime as string | undefined,
+          input.slots as Array<{ dayOfWeek: string; startTime: string; endTime?: string }>,
           input.endDate as string | undefined
         );
 
@@ -1244,6 +1274,7 @@ KEY BEHAVIORS:
       start: appt.startTime,
       end: appt.endTime,
       formatted: `Booked ${matchedClient!.name} for ${startFormatted}.${sessionInfo}`,
+      _verify: "Call list_appointments for this date to confirm the booking exists.",
     });
   }
 
@@ -1301,6 +1332,7 @@ KEY BEHAVIORS:
     return JSON.stringify({
       success: true,
       message: `Cancelled ${appt.clientName}'s appointment on ${formatLocalTimeShort(appt.startTime)}.${refundInfo}`,
+      _verify: "Call list_appointments to confirm the cancellation.",
     });
   }
 
@@ -1433,6 +1465,7 @@ KEY BEHAVIORS:
       success: true,
       clientId,
       message: `Added ${name} (${phone})${pkg ? ` with ${pkg} package (${sessionCount} sessions)` : ""}.`,
+      _verify: "Call get_client_info to confirm the client was added.",
     });
   }
 
@@ -1560,6 +1593,7 @@ KEY BEHAVIORS:
     return JSON.stringify({
       success: true,
       message: `Deactivated ${matched!.name}. They won't appear in active client lists. Their appointment history is preserved.`,
+      _verify: "Call get_client_info to confirm deactivation.",
     });
   }
 
@@ -1614,64 +1648,100 @@ KEY BEHAVIORS:
       newBalance,
       packageType: packageType || matched!.packageType,
       message: `Updated ${matched!.name}'s sessions from ${currentBalance} to ${newBalance}.${packageType ? ` Package: ${packageType}.` : ""}`,
+      _verify: "Call get_session_balance to confirm the new balance.",
     });
   }
 
   private async toolCreateRecurring(
     clientName: string,
-    dayOfWeekStr: string,
-    startTime: string,
-    endTime?: string,
+    slots: Array<{ dayOfWeek: string; startTime: string; endTime?: string }>,
     endDate?: string
   ): Promise<string> {
-    const dayOfWeek = DAY_MAP[dayOfWeekStr];
-    if (dayOfWeek === undefined) {
-      return JSON.stringify({ error: `Invalid day: ${dayOfWeekStr}` });
+    if (!slots || slots.length === 0) {
+      return JSON.stringify({ error: "No slots provided." });
     }
 
     // Find client
     const { client: matched, error } = this.resolveClient(clientName);
     if (error) return JSON.stringify({ error });
 
-    // Calculate end time (default 1 hour)
-    const actualEnd = endTime || (() => {
-      const [h, m] = startTime.split(":").map(Number);
-      return `${String(h + 1).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
-    })();
+    // --- Phase 1: Validate ALL slots before creating any (atomic) ---
 
-    // Check for duplicate
-    const existing = db
-      .select()
-      .from(recurringSchedules)
-      .where(
-        and(
-          eq(recurringSchedules.clientId, matched!.id),
-          eq(recurringSchedules.dayOfWeek, dayOfWeek),
-          eq(recurringSchedules.startTime, startTime)
+    const parsedSlots: Array<{ dayOfWeek: number; dayName: string; startTime: string; endTime: string }> = [];
+    const failures: string[] = [];
+
+    for (const slot of slots) {
+      const dayOfWeek = DAY_MAP[slot.dayOfWeek];
+      if (dayOfWeek === undefined) {
+        failures.push(`Invalid day: ${slot.dayOfWeek}`);
+        continue;
+      }
+
+      const slotEnd = slot.endTime || (() => {
+        const [h, m] = slot.startTime.split(":").map(Number);
+        return `${String(h + 1).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+      })();
+
+      // Check for duplicate
+      const existing = db
+        .select()
+        .from(recurringSchedules)
+        .where(
+          and(
+            eq(recurringSchedules.clientId, matched!.id),
+            eq(recurringSchedules.dayOfWeek, dayOfWeek),
+            eq(recurringSchedules.startTime, slot.startTime)
+          )
         )
-      )
-      .get();
+        .get();
 
-    if (existing) {
+      if (existing) {
+        failures.push(`${matched!.name} already has a recurring ${slot.dayOfWeek} at ${slot.startTime}`);
+        continue;
+      }
+
+      // Check availability for this day/time
+      const availRules = db
+        .select()
+        .from(availability)
+        .all()
+        .filter((a) => a.dayOfWeek === dayOfWeek && !a.isBlocked && !a.overrideDate);
+
+      const withinAvail = availRules.some(
+        (w) => slot.startTime >= w.startTime && slotEnd <= w.endTime
+      );
+
+      if (!withinAvail) {
+        failures.push(`No availability on ${slot.dayOfWeek}s for ${slot.startTime}-${slotEnd}. Set your hours first.`);
+        continue;
+      }
+
+      parsedSlots.push({ dayOfWeek, dayName: slot.dayOfWeek, startTime: slot.startTime, endTime: slotEnd });
+    }
+
+    // If ANY slot failed validation, reject the ENTIRE operation
+    if (failures.length > 0) {
       return JSON.stringify({
-        error: `${matched!.name} already has a recurring ${dayOfWeekStr} at ${startTime}.`,
+        error: `Cannot create recurring schedule — some slots failed validation. Fix these first:\n${failures.map(f => `• ${f}`).join("\n")}\n\nNo schedules were created.`,
       });
     }
 
-    // Create the recurring schedule
-    db.insert(recurringSchedules)
-      .values({
-        clientId: matched!.id,
-        dayOfWeek,
-        startTime,
-        endTime: actualEnd,
-        endDate: endDate || null,
-        active: 1,
-      })
-      .run();
+    // --- Phase 2: All validated — create all schedules ---
+
+    for (const slot of parsedSlots) {
+      db.insert(recurringSchedules)
+        .values({
+          clientId: matched!.id,
+          dayOfWeek: slot.dayOfWeek,
+          startTime: slot.startTime,
+          endTime: slot.endTime,
+          endDate: endDate || null,
+          active: 1,
+        })
+        .run();
+    }
 
     // Delete existing recurring appointments for this client and regenerate
-    // so all schedules get fair distribution of sessions
     const existingRecurring = db
       .select()
       .from(appointments)
@@ -1692,11 +1762,13 @@ KEY BEHAVIORS:
     const generated = await generateForClient(matched!.id);
 
     // SMS: recurring schedule confirmation
-    await this.trySendSms(matched!.phone, `You're booked for ${dayOfWeekStr}s at ${startTime}. See you next week!`);
+    const slotSummary = parsedSlots.map(s => `${s.dayName}s at ${s.startTime}`).join(" and ");
+    await this.trySendSms(matched!.phone, `You're booked for ${slotSummary}. See you next week!`);
 
     return JSON.stringify({
       success: true,
-      message: `Created recurring ${dayOfWeekStr} at ${startTime} for ${matched!.name}. Generated ${generated.created} upcoming appointments.`,
+      message: `Created ${parsedSlots.length} recurring schedule(s) for ${matched!.name}: ${slotSummary}. Generated ${generated.created} upcoming appointments.`,
+      _verify: "Call list_recurring_schedules and list_appointments to confirm schedules and generated appointments.",
     });
   }
 
@@ -1752,11 +1824,12 @@ KEY BEHAVIORS:
           success: true,
           warning: `${client.name} has ${client.sessionsRemaining} sessions remaining. They need to purchase more.`,
           message: `Marked appointment #${appointmentId} as completed.`,
+          _verify: "Call list_appointments to confirm the status change.",
         });
       }
     }
 
-    return JSON.stringify({ success: true, message: `Marked appointment #${appointmentId} as completed.` });
+    return JSON.stringify({ success: true, message: `Marked appointment #${appointmentId} as completed.`, _verify: "Call list_appointments to confirm the status change." });
   }
 
   private async toolMarkNoShow(appointmentId: number, deductSession: boolean): Promise<string> {
@@ -1782,6 +1855,7 @@ KEY BEHAVIORS:
     return JSON.stringify({
       success: true,
       message: `Marked appointment #${appointmentId} as no-show.${deductMsg}`,
+      _verify: "Call list_appointments to confirm the status change.",
     });
   }
 
@@ -1814,6 +1888,7 @@ KEY BEHAVIORS:
       success: true,
       appointmentId: result.appointment!.id,
       message: `Rescheduled to ${formatLocalTimeShort(result.appointment!.startTime)}.`,
+      _verify: "Call list_appointments for the new date to confirm the reschedule.",
     });
   }
 
@@ -1877,7 +1952,7 @@ KEY BEHAVIORS:
       );
     }
 
-    return JSON.stringify({ success: true, message: `Updated recurring schedule #${scheduleId}.` });
+    return JSON.stringify({ success: true, message: `Updated recurring schedule #${scheduleId}.`, _verify: "Call list_recurring_schedules to confirm the update." });
   }
 
   private async toolDeleteRecurring(scheduleId: number): Promise<string> {
@@ -1900,7 +1975,7 @@ KEY BEHAVIORS:
       );
     }
 
-    return JSON.stringify({ success: true, message: `Deleted recurring schedule #${scheduleId} and cancelled future appointments.` });
+    return JSON.stringify({ success: true, message: `Deleted recurring schedule #${scheduleId} and cancelled future appointments.`, _verify: "Call list_recurring_schedules to confirm deletion." });
   }
 
   private async toolSkipRecurring(
@@ -1930,6 +2005,7 @@ KEY BEHAVIORS:
       success: true,
       skipped: result.skipped,
       message: `Skipped ${result.skipped} week(s) for ${matched!.name}.`,
+      _verify: "Call list_appointments to confirm the skipped weeks.",
     });
   }
 
@@ -1951,7 +2027,12 @@ KEY BEHAVIORS:
       msg += ` Cancelled ${result.cancelledAppointments.length} appointment(s): ${cancelled}. Affected clients have been notified.`;
     }
 
-    return JSON.stringify({ success: true, message: msg });
+    return JSON.stringify({
+      success: true,
+      message: msg,
+      _action: "set_availability",
+      _verify: "You MUST now call list_availability to confirm the actual state before responding to the user.",
+    });
   }
 
   private async toolListAvailability(): Promise<string> {
@@ -1998,7 +2079,7 @@ KEY BEHAVIORS:
       msg += ` Cancelled ${result.cancelledAppointments.length} appointment(s): ${cancelled}. Affected clients have been notified.`;
     }
 
-    return JSON.stringify({ success: true, message: msg });
+    return JSON.stringify({ success: true, message: msg, _verify: "Call list_availability to confirm the override." });
   }
 
   private async toolRemoveBlock(blockId: number): Promise<string> {
@@ -2038,7 +2119,7 @@ KEY BEHAVIORS:
     if (!result.success) {
       return JSON.stringify({ error: result.error });
     }
-    return JSON.stringify({ success: true, message: `Updated ${matched!.name}'s details.` });
+    return JSON.stringify({ success: true, message: `Updated ${matched!.name}'s details.`, _verify: "Call get_client_info to confirm the update." });
   }
 
   private async toolReactivateClient(clientName: string): Promise<string> {
@@ -2054,7 +2135,7 @@ KEY BEHAVIORS:
     // SMS: welcome back
     await this.trySendSms(matched!.phone, `You've been reactivated! Reply to this number to book sessions.`);
 
-    return JSON.stringify({ success: true, message: `Reactivated ${matched!.name}.` });
+    return JSON.stringify({ success: true, message: `Reactivated ${matched!.name}.`, _verify: "Call get_client_info to confirm reactivation." });
   }
 
   private async toolDeleteClient(clientName: string): Promise<string> {
@@ -2075,6 +2156,7 @@ KEY BEHAVIORS:
     return JSON.stringify({
       success: true,
       message: `Permanently deleted ${matched!.name} and all their data (appointments, recurring schedules, session history, messages).`,
+      _verify: "Call list_clients to confirm deletion.",
     });
   }
 

@@ -5,6 +5,20 @@ This file is the source of truth for what tools exist and what's missing.
 
 ---
 
+## Invariant — Never Assume, Always Verify
+
+The AI assistant must NEVER assume or hallucinate the state of the system. Before making any claim about appointments, clients, sessions, or schedules:
+
+1. **Always call the appropriate tool** to check the actual DB state. Do not rely on memory of what "should" have happened.
+2. **After every mutation** (book, cancel, reschedule, create recurring, etc.), call a read tool (`list_appointments`, `get_client_info`, `get_session_balance`, `list_recurring_schedules`) to verify the operation succeeded and report the actual result.
+3. **Never say "done" or confirm success** based on the tool call alone — read back the state and confirm it matches expectations.
+4. **If a tool returns an error**, report the exact error to the instructor. Do not paraphrase or soften it.
+5. **If asked about current state** (e.g., "does Umang have appointments?"), always call the tool first. Never answer from memory of a prior conversation turn.
+
+This prevents the AI from telling the instructor "I've booked 20 appointments" when in reality the operation failed or was partially applied.
+
+---
+
 ## Invariants — Session & Conflict Rules
 
 These rules apply to EVERY tool that creates, moves, or closes an appointment.
@@ -16,6 +30,16 @@ Any new tool must enforce all of them.
   2. **Within availability window** — the slot falls inside a recurring or override availability rule.
   3. **Not blocked** — no `isBlocked=1` override covers the slot.
 - If any check fails, the operation must fail and the original state must be unchanged (atomic).
+
+### Atomicity — no partial creates
+
+All appointment creation operations must be **all-or-nothing**:
+
+- **Single booking (`book_appointment`):** If any check fails, no appointment is created.
+- **Recurring schedule (`create_recurring_schedule`):** If the instructor requests multiple days (e.g., Tuesday + Friday at 8 AM), validate ALL requested slots against availability BEFORE creating anything. If Tuesday has availability but Friday does not, the ENTIRE operation must fail — do not create Tuesday alone. Return the list of slots that failed validation so the instructor can fix availability first or choose different times.
+- **Multi-step operations (`reschedule_appointment`):** Validate the new slot before touching the old one. If the new slot fails, the old appointment stays untouched.
+
+The key principle: **the instructor should never end up with a partially-created schedule.** Either everything they asked for succeeds, or nothing changes and they get a clear error explaining which slots failed and why.
 
 ### Session balance accounting
 | Event | Session effect | Ledger entry |
@@ -57,10 +81,11 @@ Every balance change MUST be recorded in the `session_ledger` table with `client
 
 **`create_recurring_schedule` details:**
 - Accepts **multiple day/time pairs** in a single call. Example: "Sarah trains Tuesday 9am and Thursday 9am" → creates 2 recurring schedule entries.
+- **ATOMIC — all or nothing.** If multiple day/time pairs are requested, validate ALL of them against availability BEFORE creating any. If Tuesday 8am has availability but Friday 8am does not, the ENTIRE operation fails. Return which specific slots failed and why. The instructor must fix availability or choose different times before retrying.
 - Starts generating from the **next available date** (not today, not past dates).
 - **Generate indefinitely** — recurring appointments are generated on a rolling basis into the future (e.g. 12 weeks out, extended by a cron/background job). They are NOT limited by `sessionsRemaining`. The purpose is to **hold the time slot** on the calendar so no one else can book it, even if the client's sessions run out and they haven't renewed yet.
 - **Availability check per slot** — each recurring day/time must fall within the instructor's availability rules. If the instructor has no availability window covering e.g. Thursday 9am, reject that slot and tell the instructor why.
-- Example: client recurs Tue + Thu at 9am → appointments are generated every Tue and Thu indefinitely, regardless of session balance.
+- Example: client recurs Tue + Thu at 9am → check both have availability → only if both pass, create both schedule entries and generate appointments.
 
 ### Recurring schedule invariants
 
