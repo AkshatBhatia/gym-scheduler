@@ -8,7 +8,7 @@ import {
   messages,
   recurringSchedules,
 } from "../db/schema.js";
-import { generateForClient } from "./recurring.js";
+import { generateForClient, listRecurringSchedules, updateRecurringSchedule, deleteRecurringSchedule } from "./recurring.js";
 import { eq, and, gte, lte, like, desc, sql } from "drizzle-orm";
 import { DateTime } from "luxon";
 import {
@@ -18,13 +18,48 @@ import {
   utcToLocal,
   localToUTC,
 } from "./timezone.js";
-import { bookAppointment, cancelAppointment, getAvailableSlots } from "./scheduling.js";
+import { bookAppointment, cancelAppointment, completeAppointment, markNoShow, rescheduleAppointment, skipRecurringInstance, getAvailableSlots } from "./scheduling.js";
+import { listClients, updateClient, reactivateClient, deleteClient } from "./clients.js";
+import { setAvailability, listAvailability, overrideAvailability, removeBlock } from "./availability.js";
+import { getDailySummary, getWeeklySummary } from "./dashboard.js";
+import { sendMessageToClient } from "./messaging.js";
+import { sendSms } from "./sms.js";
+
+const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"] as const;
+const DAY_MAP: Record<string, number> = {
+  Sunday: 0, Monday: 1, Tuesday: 2, Wednesday: 3,
+  Thursday: 4, Friday: 5, Saturday: 6,
+};
 
 export class ChatAgent {
   private anthropic: Anthropic;
 
   constructor() {
     this.anthropic = new Anthropic();
+  }
+
+  private resolveClient(
+    clientName: string,
+    opts?: { includeInactive?: boolean }
+  ): { client?: typeof clients.$inferSelect; error?: string } {
+    const rows = opts?.includeInactive
+      ? db.select().from(clients).all()
+      : db.select().from(clients).where(eq(clients.active, 1)).all();
+    const matched = rows.find((c) =>
+      c.name.toLowerCase().includes(clientName.toLowerCase())
+    );
+    if (!matched) {
+      return { error: `No client found matching "${clientName}".` };
+    }
+    return { client: matched };
+  }
+
+  private async trySendSms(phone: string, body: string): Promise<void> {
+    try {
+      await sendSms(phone, body);
+    } catch (e) {
+      console.error(`[SMS] Failed to send to ${phone}:`, e);
+    }
   }
 
   /**
@@ -665,8 +700,285 @@ KEY BEHAVIORS:
               type: "string",
               description: "End time in HH:MM format (24-hour). Defaults to 1 hour after start.",
             },
+            endDate: {
+              type: "string",
+              description: "Optional end date for the recurring schedule in YYYY-MM-DD format. If not provided, recurring continues until sessions run out.",
+            },
           },
           required: ["clientName", "dayOfWeek", "startTime"],
+        },
+      },
+      {
+        name: "mark_completed",
+        description:
+          "Mark an appointment as completed. Deducts 1 session from client balance. Use at end of day or after a session finishes.",
+        input_schema: {
+          type: "object" as const,
+          properties: {
+            appointmentId: {
+              type: "number",
+              description: "The appointment ID to mark as completed.",
+            },
+          },
+          required: ["appointmentId"],
+        },
+      },
+      {
+        name: "mark_no_show",
+        description:
+          "Mark a client as no-show for an appointment. By default does NOT deduct a session. Ask the instructor if they want to deduct before setting deductSession=true.",
+        input_schema: {
+          type: "object" as const,
+          properties: {
+            appointmentId: {
+              type: "number",
+              description: "The appointment ID to mark as no-show.",
+            },
+            deductSession: {
+              type: "boolean",
+              description: "Whether to deduct a session for the no-show. Default false. ASK the instructor before setting to true.",
+            },
+          },
+          required: ["appointmentId"],
+        },
+      },
+      {
+        name: "reschedule_appointment",
+        description:
+          "Reschedule an existing appointment to a new date/time. Atomic: if the new slot is unavailable, the old appointment stays untouched. No session change.",
+        input_schema: {
+          type: "object" as const,
+          properties: {
+            appointmentId: {
+              type: "number",
+              description: "The appointment ID to reschedule.",
+            },
+            newDateTime: {
+              type: "string",
+              description: "New start date and time in ISO format (e.g., 2025-01-15T10:00:00).",
+            },
+          },
+          required: ["appointmentId", "newDateTime"],
+        },
+      },
+      {
+        name: "list_recurring_schedules",
+        description:
+          "List recurring schedules for all clients or a specific client.",
+        input_schema: {
+          type: "object" as const,
+          properties: {
+            clientName: {
+              type: "string",
+              description: "Optional: filter by client name.",
+            },
+          },
+        },
+      },
+      {
+        name: "update_recurring_schedule",
+        description:
+          "Change the day or time of an existing recurring schedule. Regenerates future appointments.",
+        input_schema: {
+          type: "object" as const,
+          properties: {
+            scheduleId: {
+              type: "number",
+              description: "The recurring schedule ID to update.",
+            },
+            dayOfWeek: {
+              type: "string",
+              description: "New day of the week.",
+              enum: ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
+            },
+            startTime: {
+              type: "string",
+              description: "New start time in HH:MM format (24-hour).",
+            },
+            endTime: {
+              type: "string",
+              description: "New end time in HH:MM format (24-hour).",
+            },
+          },
+          required: ["scheduleId"],
+        },
+      },
+      {
+        name: "delete_recurring_schedule",
+        description:
+          "Delete a recurring schedule and cancel all its future appointments. ALWAYS ask for confirmation before calling this.",
+        input_schema: {
+          type: "object" as const,
+          properties: {
+            scheduleId: {
+              type: "number",
+              description: "The recurring schedule ID to delete.",
+            },
+          },
+          required: ["scheduleId"],
+        },
+      },
+      {
+        name: "skip_recurring_instance",
+        description:
+          "Skip one or more weeks of a client's recurring appointment. The recurring rule stays active. No session deduction.",
+        input_schema: {
+          type: "object" as const,
+          properties: {
+            clientName: {
+              type: "string",
+              description: "The client's name.",
+            },
+            scheduleId: {
+              type: "number",
+              description: "The recurring schedule ID.",
+            },
+            fromDate: {
+              type: "string",
+              description: "Start date for skipping in YYYY-MM-DD format.",
+            },
+            weeks: {
+              type: "number",
+              description: "Number of weeks to skip. Defaults to 1.",
+            },
+          },
+          required: ["clientName", "scheduleId", "fromDate"],
+        },
+      },
+      {
+        name: "set_availability",
+        description:
+          "Set the instructor's regular weekly hours. This replaces ALL existing weekly rules. Days not included will have no availability. Appointments outside the new hours are automatically cancelled.",
+        input_schema: {
+          type: "object" as const,
+          properties: {
+            rules: {
+              type: "array",
+              description: "Array of availability rules.",
+              items: {
+                type: "object",
+                properties: {
+                  dayOfWeek: { type: "number", description: "0=Sunday, 1=Monday, ..., 6=Saturday" },
+                  startTime: { type: "string", description: "Start time in HH:MM format." },
+                  endTime: { type: "string", description: "End time in HH:MM format." },
+                },
+                required: ["dayOfWeek", "startTime", "endTime"],
+              },
+            },
+          },
+          required: ["rules"],
+        },
+      },
+      {
+        name: "list_availability",
+        description:
+          "View the instructor's current weekly hours, date overrides, and blocked times.",
+        input_schema: {
+          type: "object" as const,
+          properties: {},
+        },
+      },
+      {
+        name: "override_availability",
+        description:
+          "Set a one-off availability override for a specific date. Use to add hours on an off-day or change hours for one day. Appointments outside the new window are cancelled.",
+        input_schema: {
+          type: "object" as const,
+          properties: {
+            date: { type: "string", description: "Date in YYYY-MM-DD format." },
+            startTime: { type: "string", description: "Start time in HH:MM format." },
+            endTime: { type: "string", description: "End time in HH:MM format." },
+          },
+          required: ["date", "startTime", "endTime"],
+        },
+      },
+      {
+        name: "remove_block",
+        description: "Remove a previously blocked time slot to re-open it for bookings.",
+        input_schema: {
+          type: "object" as const,
+          properties: {
+            blockId: { type: "number", description: "The block ID to remove." },
+          },
+          required: ["blockId"],
+        },
+      },
+      {
+        name: "list_clients",
+        description: "List all active clients, optionally filtered by name search.",
+        input_schema: {
+          type: "object" as const,
+          properties: {
+            search: { type: "string", description: "Optional search term to filter by name." },
+          },
+        },
+      },
+      {
+        name: "update_client",
+        description: "Update a client's contact details (name, phone, email, notes). Does NOT change session balance.",
+        input_schema: {
+          type: "object" as const,
+          properties: {
+            clientName: { type: "string", description: "The client's current name (to find them)." },
+            name: { type: "string", description: "New name." },
+            phone: { type: "string", description: "New phone in E.164 format." },
+            email: { type: "string", description: "New email." },
+            notes: { type: "string", description: "New notes." },
+          },
+          required: ["clientName"],
+        },
+      },
+      {
+        name: "reactivate_client",
+        description: "Reactivate a previously deactivated client.",
+        input_schema: {
+          type: "object" as const,
+          properties: {
+            clientName: { type: "string", description: "The client's name." },
+          },
+          required: ["clientName"],
+        },
+      },
+      {
+        name: "delete_client",
+        description:
+          "PERMANENTLY delete a client and ALL their data (appointments, recurring schedules, session history, messages). This CANNOT be undone. ALWAYS ask the instructor for confirmation before calling this.",
+        input_schema: {
+          type: "object" as const,
+          properties: {
+            clientName: { type: "string", description: "The client's name." },
+          },
+          required: ["clientName"],
+        },
+      },
+      {
+        name: "get_daily_summary",
+        description: "Get today's summary: appointment count, upcoming list, and clients with low session balances.",
+        input_schema: {
+          type: "object" as const,
+          properties: {},
+        },
+      },
+      {
+        name: "get_weekly_summary",
+        description: "Get a week-at-a-glance: appointments per day and total count.",
+        input_schema: {
+          type: "object" as const,
+          properties: {
+            weekStart: { type: "string", description: "Optional start date (Monday) in YYYY-MM-DD. Defaults to current week." },
+          },
+        },
+      },
+      {
+        name: "send_message",
+        description: "Send an SMS message to a client.",
+        input_schema: {
+          type: "object" as const,
+          properties: {
+            clientName: { type: "string", description: "The client's name." },
+            body: { type: "string", description: "The message text to send." },
+          },
+          required: ["clientName", "body"],
         },
       },
     ];
@@ -742,7 +1054,91 @@ KEY BEHAVIORS:
           input.clientName as string,
           input.dayOfWeek as string,
           input.startTime as string,
+          input.endTime as string | undefined,
+          input.endDate as string | undefined
+        );
+
+      case "mark_completed":
+        return this.toolMarkCompleted(input.appointmentId as number);
+
+      case "mark_no_show":
+        return this.toolMarkNoShow(
+          input.appointmentId as number,
+          (input.deductSession as boolean) ?? false
+        );
+
+      case "reschedule_appointment":
+        return this.toolReschedule(
+          input.appointmentId as number,
+          input.newDateTime as string
+        );
+
+      case "list_recurring_schedules":
+        return this.toolListRecurring(input.clientName as string | undefined);
+
+      case "update_recurring_schedule":
+        return this.toolUpdateRecurring(
+          input.scheduleId as number,
+          input.dayOfWeek as string | undefined,
+          input.startTime as string | undefined,
           input.endTime as string | undefined
+        );
+
+      case "delete_recurring_schedule":
+        return this.toolDeleteRecurring(input.scheduleId as number);
+
+      case "skip_recurring_instance":
+        return this.toolSkipRecurring(
+          input.clientName as string,
+          input.scheduleId as number,
+          input.fromDate as string,
+          (input.weeks as number) ?? 1
+        );
+
+      case "set_availability":
+        return this.toolSetAvailability(input.rules as Array<{ dayOfWeek: number; startTime: string; endTime: string }>);
+
+      case "list_availability":
+        return this.toolListAvailability();
+
+      case "override_availability":
+        return this.toolOverrideAvailability(
+          input.date as string,
+          input.startTime as string,
+          input.endTime as string
+        );
+
+      case "remove_block":
+        return this.toolRemoveBlock(input.blockId as number);
+
+      case "list_clients":
+        return this.toolListClients(input.search as string | undefined);
+
+      case "update_client":
+        return this.toolUpdateClient(
+          input.clientName as string,
+          input.name as string | undefined,
+          input.phone as string | undefined,
+          input.email as string | undefined,
+          input.notes as string | undefined
+        );
+
+      case "reactivate_client":
+        return this.toolReactivateClient(input.clientName as string);
+
+      case "delete_client":
+        return this.toolDeleteClient(input.clientName as string);
+
+      case "get_daily_summary":
+        return this.toolDailySummary();
+
+      case "get_weekly_summary":
+        return this.toolWeeklySummary(input.weekStart as string | undefined);
+
+      case "send_message":
+        return this.toolSendMessage(
+          input.clientName as string,
+          input.body as string
         );
 
       default:
@@ -810,22 +1206,14 @@ KEY BEHAVIORS:
     notes?: string
   ): Promise<string> {
     // Find client by name (case-insensitive partial match)
-    const allClients = db.select().from(clients).where(eq(clients.active, 1)).all();
-    const matchedClient = allClients.find((c) =>
-      c.name.toLowerCase().includes(clientName.toLowerCase())
-    );
-
-    if (!matchedClient) {
-      return JSON.stringify({
-        error: `No client found matching "${clientName}". Available clients: ${allClients.map((c) => c.name).join(", ")}`,
-      });
-    }
+    const { client: matchedClient, error } = this.resolveClient(clientName);
+    if (error) return JSON.stringify({ error });
 
     // Convert local time to UTC for storage
     const startUTC = localToUTC(dateTime);
 
     // Delegate to scheduling service (handles past check, availability, conflicts, UTC format)
-    const result = await bookAppointment(matchedClient.id, startUTC, notes);
+    const result = await bookAppointment(matchedClient!.id, startUTC, notes);
     if (!result.success) {
       return JSON.stringify({ error: result.error });
     }
@@ -834,22 +1222,28 @@ KEY BEHAVIORS:
 
     // Show current session balance (sessions are deducted on completion, not booking)
     let sessionInfo = "";
-    if (matchedClient.sessionsRemaining !== null) {
-      sessionInfo = ` Sessions remaining: ${matchedClient.sessionsRemaining}.`;
-      if (matchedClient.sessionsRemaining <= 2) {
+    if (matchedClient!.sessionsRemaining !== null) {
+      sessionInfo = ` Sessions remaining: ${matchedClient!.sessionsRemaining}.`;
+      if (matchedClient!.sessionsRemaining! <= 2) {
         sessionInfo += ` WARNING: Low session balance!`;
       }
     }
 
     const startFormatted = formatLocalTimeShort(appt.startTime);
 
+    // SMS: booking confirmation
+    const localStart = utcToLocal(appt.startTime);
+    const dateStr = localStart.slice(0, 10);
+    const timeStr = localStart.slice(11, 16);
+    await this.trySendSms(matchedClient!.phone, `Your appointment is confirmed for ${dateStr} at ${timeStr}. See you then!`);
+
     return JSON.stringify({
       success: true,
       appointmentId: appt.id,
-      client: matchedClient.name,
+      client: matchedClient!.name,
       start: appt.startTime,
       end: appt.endTime,
-      formatted: `Booked ${matchedClient.name} for ${startFormatted}.${sessionInfo}`,
+      formatted: `Booked ${matchedClient!.name} for ${startFormatted}.${sessionInfo}`,
     });
   }
 
@@ -897,6 +1291,13 @@ KEY BEHAVIORS:
       refundInfo = ` Session refunded (balance: ${newBalance}).`;
     }
 
+    // SMS: cancellation notice
+    const client = db.select().from(clients).where(eq(clients.id, appt.clientId)).get();
+    if (client) {
+      const localStart = utcToLocal(appt.startTime);
+      await this.trySendSms(client.phone, `Your appointment on ${localStart.slice(0, 10)} at ${localStart.slice(11, 16)} has been cancelled.`);
+    }
+
     return JSON.stringify({
       success: true,
       message: `Cancelled ${appt.clientName}'s appointment on ${formatLocalTimeShort(appt.startTime)}.${refundInfo}`,
@@ -904,19 +1305,11 @@ KEY BEHAVIORS:
   }
 
   private async toolGetClientInfo(clientName: string): Promise<string> {
-    const allClients = db.select().from(clients).all();
-    const matched = allClients.filter((c) =>
-      c.name.toLowerCase().includes(clientName.toLowerCase())
-    );
-
-    if (matched.length === 0) {
-      return JSON.stringify({
-        error: `No client found matching "${clientName}".`,
-      });
-    }
+    const { client: matched, error } = this.resolveClient(clientName, { includeInactive: true });
+    if (error) return JSON.stringify({ error });
 
     const results = [];
-    for (const client of matched) {
+    for (const client of [matched!]) {
       // Get upcoming appointments
       const upcoming = db
         .select()
@@ -951,30 +1344,22 @@ KEY BEHAVIORS:
   }
 
   private async toolGetSessionBalance(clientName: string): Promise<string> {
-    const allClients = db.select().from(clients).all();
-    const matched = allClients.find((c) =>
-      c.name.toLowerCase().includes(clientName.toLowerCase())
-    );
-
-    if (!matched) {
-      return JSON.stringify({
-        error: `No client found matching "${clientName}".`,
-      });
-    }
+    const { client: matched, error } = this.resolveClient(clientName);
+    if (error) return JSON.stringify({ error });
 
     // Get recent ledger entries
     const ledger = db
       .select()
       .from(sessionLedger)
-      .where(eq(sessionLedger.clientId, matched.id))
+      .where(eq(sessionLedger.clientId, matched!.id))
       .orderBy(desc(sessionLedger.createdAt))
       .limit(5)
       .all();
 
     return JSON.stringify({
-      client: matched.name,
-      packageType: matched.packageType,
-      sessionsRemaining: matched.sessionsRemaining,
+      client: matched!.name,
+      packageType: matched!.packageType,
+      sessionsRemaining: matched!.sessionsRemaining,
       recentActivity: ledger.map((l) => ({
         change: l.changeAmount,
         balance: l.balanceAfter,
@@ -1041,6 +1426,9 @@ KEY BEHAVIORS:
         .run();
     }
 
+    // SMS: welcome message
+    await this.trySendSms(phone, `Welcome! You've been added to your trainer's schedule. Reply to this number to book or manage appointments.`);
+
     return JSON.stringify({
       success: true,
       clientId,
@@ -1092,15 +1480,7 @@ KEY BEHAVIORS:
 
     return JSON.stringify({
       date,
-      dayOfWeek: [
-        "Sunday",
-        "Monday",
-        "Tuesday",
-        "Wednesday",
-        "Thursday",
-        "Friday",
-        "Saturday",
-      ][dayOfWeek],
+      dayOfWeek: DAY_NAMES[dayOfWeek],
       availableSlots,
       count: availableSlots.length,
     });
@@ -1163,28 +1543,23 @@ KEY BEHAVIORS:
   }
 
   private async toolDeactivateClient(clientName: string): Promise<string> {
-    const allClients = db.select().from(clients).where(eq(clients.active, 1)).all();
-    const matched = allClients.find((c) =>
-      c.name.toLowerCase().includes(clientName.toLowerCase())
-    );
-    if (!matched) {
-      return JSON.stringify({ error: `No active client found matching "${clientName}".` });
-    }
+    const { client: matched, error } = this.resolveClient(clientName);
+    if (error) return JSON.stringify({ error });
 
     db.update(clients)
       .set({ active: 0, updatedAt: new Date().toISOString() })
-      .where(eq(clients.id, matched.id))
+      .where(eq(clients.id, matched!.id))
       .run();
 
     // Deactivate their recurring schedules too
     db.update(recurringSchedules)
       .set({ active: 0, updatedAt: new Date().toISOString() })
-      .where(eq(recurringSchedules.clientId, matched.id))
+      .where(eq(recurringSchedules.clientId, matched!.id))
       .run();
 
     return JSON.stringify({
       success: true,
-      message: `Deactivated ${matched.name}. They won't appear in active client lists. Their appointment history is preserved.`,
+      message: `Deactivated ${matched!.name}. They won't appear in active client lists. Their appointment history is preserved.`,
     });
   }
 
@@ -1194,15 +1569,10 @@ KEY BEHAVIORS:
     mode: string,
     packageType?: string
   ): Promise<string> {
-    const allClients = db.select().from(clients).where(eq(clients.active, 1)).all();
-    const matched = allClients.find((c) =>
-      c.name.toLowerCase().includes(clientName.toLowerCase())
-    );
-    if (!matched) {
-      return JSON.stringify({ error: `No client found matching "${clientName}".` });
-    }
+    const { client: matched, error } = this.resolveClient(clientName);
+    if (error) return JSON.stringify({ error });
 
-    const currentBalance = matched.sessionsRemaining ?? 0;
+    const currentBalance = matched!.sessionsRemaining ?? 0;
     const newBalance = mode === "add" ? currentBalance + sessions : sessions;
 
     const updateData: Record<string, unknown> = {
@@ -1215,7 +1585,7 @@ KEY BEHAVIORS:
 
     db.update(clients)
       .set(updateData)
-      .where(eq(clients.id, matched.id))
+      .where(eq(clients.id, matched!.id))
       .run();
 
     // Log to session ledger
@@ -1223,7 +1593,7 @@ KEY BEHAVIORS:
     if (change !== 0) {
       db.insert(sessionLedger)
         .values({
-          clientId: matched.id,
+          clientId: matched!.id,
           changeAmount: change,
           balanceAfter: newBalance,
           reason: mode === "add" ? "Sessions added" : "Balance updated",
@@ -1232,15 +1602,18 @@ KEY BEHAVIORS:
     }
 
     // Auto-generate recurring appointments for the new balance
-    await generateForClient(matched.id);
+    await generateForClient(matched!.id);
+
+    // SMS: balance update notification
+    await this.trySendSms(matched!.phone, `Your session balance has been updated. You now have ${newBalance} sessions remaining.`);
 
     return JSON.stringify({
       success: true,
-      client: matched.name,
+      client: matched!.name,
       previousBalance: currentBalance,
       newBalance,
-      packageType: packageType || matched.packageType,
-      message: `Updated ${matched.name}'s sessions from ${currentBalance} to ${newBalance}.${packageType ? ` Package: ${packageType}.` : ""}`,
+      packageType: packageType || matched!.packageType,
+      message: `Updated ${matched!.name}'s sessions from ${currentBalance} to ${newBalance}.${packageType ? ` Package: ${packageType}.` : ""}`,
     });
   }
 
@@ -1248,25 +1621,17 @@ KEY BEHAVIORS:
     clientName: string,
     dayOfWeekStr: string,
     startTime: string,
-    endTime?: string
+    endTime?: string,
+    endDate?: string
   ): Promise<string> {
-    const dayMap: Record<string, number> = {
-      Sunday: 0, Monday: 1, Tuesday: 2, Wednesday: 3,
-      Thursday: 4, Friday: 5, Saturday: 6,
-    };
-    const dayOfWeek = dayMap[dayOfWeekStr];
+    const dayOfWeek = DAY_MAP[dayOfWeekStr];
     if (dayOfWeek === undefined) {
       return JSON.stringify({ error: `Invalid day: ${dayOfWeekStr}` });
     }
 
     // Find client
-    const allClients = db.select().from(clients).where(eq(clients.active, 1)).all();
-    const matched = allClients.find((c) =>
-      c.name.toLowerCase().includes(clientName.toLowerCase())
-    );
-    if (!matched) {
-      return JSON.stringify({ error: `No client found matching "${clientName}".` });
-    }
+    const { client: matched, error } = this.resolveClient(clientName);
+    if (error) return JSON.stringify({ error });
 
     // Calculate end time (default 1 hour)
     const actualEnd = endTime || (() => {
@@ -1280,7 +1645,7 @@ KEY BEHAVIORS:
       .from(recurringSchedules)
       .where(
         and(
-          eq(recurringSchedules.clientId, matched.id),
+          eq(recurringSchedules.clientId, matched!.id),
           eq(recurringSchedules.dayOfWeek, dayOfWeek),
           eq(recurringSchedules.startTime, startTime)
         )
@@ -1289,17 +1654,18 @@ KEY BEHAVIORS:
 
     if (existing) {
       return JSON.stringify({
-        error: `${matched.name} already has a recurring ${dayOfWeekStr} at ${startTime}.`,
+        error: `${matched!.name} already has a recurring ${dayOfWeekStr} at ${startTime}.`,
       });
     }
 
     // Create the recurring schedule
     db.insert(recurringSchedules)
       .values({
-        clientId: matched.id,
+        clientId: matched!.id,
         dayOfWeek,
         startTime,
         endTime: actualEnd,
+        endDate: endDate || null,
         active: 1,
       })
       .run();
@@ -1311,7 +1677,7 @@ KEY BEHAVIORS:
       .from(appointments)
       .where(
         and(
-          eq(appointments.clientId, matched.id),
+          eq(appointments.clientId, matched!.id),
           eq(appointments.status, "confirmed")
         )
       )
@@ -1323,11 +1689,14 @@ KEY BEHAVIORS:
     }
 
     // Regenerate all recurring appointments with fair distribution
-    const generated = await generateForClient(matched.id);
+    const generated = await generateForClient(matched!.id);
+
+    // SMS: recurring schedule confirmation
+    await this.trySendSms(matched!.phone, `You're booked for ${dayOfWeekStr}s at ${startTime}. See you next week!`);
 
     return JSON.stringify({
       success: true,
-      message: `Created recurring ${dayOfWeekStr} at ${startTime} for ${matched.name}. Generated ${generated.created} upcoming appointments across all recurring days based on their ${matched.sessionsRemaining ?? 0} remaining sessions.`,
+      message: `Created recurring ${dayOfWeekStr} at ${startTime} for ${matched!.name}. Generated ${generated.created} upcoming appointments.`,
     });
   }
 
@@ -1364,6 +1733,379 @@ KEY BEHAVIORS:
     }
 
     return result;
+  }
+
+  // ---- New tool implementations ----
+
+  private async toolMarkCompleted(appointmentId: number): Promise<string> {
+    const result = await completeAppointment(appointmentId);
+    if (!result.success) {
+      return JSON.stringify({ error: result.error });
+    }
+
+    // Check if balance went negative — warn instructor
+    const appt = db.select().from(appointments).where(eq(appointments.id, appointmentId)).get();
+    if (appt) {
+      const client = db.select().from(clients).where(eq(clients.id, appt.clientId)).get();
+      if (client && (client.sessionsRemaining ?? 0) <= 0) {
+        return JSON.stringify({
+          success: true,
+          warning: `${client.name} has ${client.sessionsRemaining} sessions remaining. They need to purchase more.`,
+          message: `Marked appointment #${appointmentId} as completed.`,
+        });
+      }
+    }
+
+    return JSON.stringify({ success: true, message: `Marked appointment #${appointmentId} as completed.` });
+  }
+
+  private async toolMarkNoShow(appointmentId: number, deductSession: boolean): Promise<string> {
+    const appt = db
+      .select({ clientId: appointments.clientId, startTime: appointments.startTime, clientName: clients.name, clientPhone: clients.phone })
+      .from(appointments)
+      .innerJoin(clients, eq(appointments.clientId, clients.id))
+      .where(eq(appointments.id, appointmentId))
+      .get();
+
+    const result = await markNoShow(appointmentId, deductSession);
+    if (!result.success) {
+      return JSON.stringify({ error: result.error });
+    }
+
+    // SMS: missed session notice
+    if (appt) {
+      const localStart = utcToLocal(appt.startTime);
+      await this.trySendSms(appt.clientPhone, `You missed your session on ${localStart.slice(0, 10)} at ${localStart.slice(11, 16)}. Please reach out to reschedule.`);
+    }
+
+    const deductMsg = deductSession ? " Session deducted." : " No session deducted.";
+    return JSON.stringify({
+      success: true,
+      message: `Marked appointment #${appointmentId} as no-show.${deductMsg}`,
+    });
+  }
+
+  private async toolReschedule(appointmentId: number, newDateTime: string): Promise<string> {
+    // Look up original appointment for SMS
+    const original = db
+      .select({ clientId: appointments.clientId, startTime: appointments.startTime, clientName: clients.name, clientPhone: clients.phone })
+      .from(appointments)
+      .innerJoin(clients, eq(appointments.clientId, clients.id))
+      .where(eq(appointments.id, appointmentId))
+      .get();
+
+    const newStartUTC = localToUTC(newDateTime);
+    const result = await rescheduleAppointment(appointmentId, newStartUTC);
+    if (!result.success) {
+      return JSON.stringify({ error: result.error });
+    }
+
+    // SMS: rescheduled notice
+    if (original && result.appointment) {
+      const oldLocal = utcToLocal(original.startTime);
+      const newLocal = utcToLocal(result.appointment.startTime);
+      await this.trySendSms(
+        original.clientPhone,
+        `Your appointment has been rescheduled from ${oldLocal.slice(0, 10)} at ${oldLocal.slice(11, 16)} to ${newLocal.slice(0, 10)} at ${newLocal.slice(11, 16)}.`
+      );
+    }
+
+    return JSON.stringify({
+      success: true,
+      appointmentId: result.appointment!.id,
+      message: `Rescheduled to ${formatLocalTimeShort(result.appointment!.startTime)}.`,
+    });
+  }
+
+  private async toolListRecurring(clientName?: string): Promise<string> {
+    let clientId: number | undefined;
+    if (clientName) {
+      const allClients = db.select().from(clients).where(eq(clients.active, 1)).all();
+      const matched = allClients.find((c) => c.name.toLowerCase().includes(clientName.toLowerCase()));
+      if (!matched) {
+        return JSON.stringify({ error: `No client found matching "${clientName}".` });
+      }
+      clientId = matched.id;
+    }
+
+    const schedules = await listRecurringSchedules(clientId);
+
+    return JSON.stringify({
+      count: schedules.length,
+      schedules: schedules.map((s) => ({
+        id: s.id,
+        client: s.clientName,
+        day: DAY_NAMES[s.dayOfWeek],
+        startTime: s.startTime,
+        endTime: s.endTime,
+        active: s.active === 1,
+      })),
+    });
+  }
+
+  private async toolUpdateRecurring(
+    scheduleId: number,
+    dayOfWeekStr?: string,
+    startTime?: string,
+    endTime?: string
+  ): Promise<string> {
+    // Look up schedule for SMS context
+    const schedule = db.select().from(recurringSchedules).where(eq(recurringSchedules.id, scheduleId)).get();
+    const clientBefore = schedule
+      ? db.select().from(clients).where(eq(clients.id, schedule.clientId)).get()
+      : null;
+    const oldDay = schedule ? DAY_NAMES[schedule.dayOfWeek] : "";
+    const oldTime = schedule?.startTime ?? "";
+
+    const updates: { dayOfWeek?: number; startTime?: string; endTime?: string } = {};
+    if (dayOfWeekStr) updates.dayOfWeek = DAY_MAP[dayOfWeekStr];
+    if (startTime) updates.startTime = startTime;
+    if (endTime) updates.endTime = endTime;
+
+    const result = await updateRecurringSchedule(scheduleId, updates);
+    if (!result.success) {
+      return JSON.stringify({ error: result.error });
+    }
+
+    // SMS: schedule change notice
+    if (clientBefore) {
+      const newDay = dayOfWeekStr || oldDay;
+      const newTime = startTime || oldTime;
+      await this.trySendSms(
+        clientBefore.phone,
+        `Your recurring session has moved from ${oldDay}s at ${oldTime} to ${newDay}s at ${newTime}.`
+      );
+    }
+
+    return JSON.stringify({ success: true, message: `Updated recurring schedule #${scheduleId}.` });
+  }
+
+  private async toolDeleteRecurring(scheduleId: number): Promise<string> {
+    // Look up for SMS context before deleting
+    const schedule = db.select().from(recurringSchedules).where(eq(recurringSchedules.id, scheduleId)).get();
+    const client = schedule
+      ? db.select().from(clients).where(eq(clients.id, schedule.clientId)).get()
+      : null;
+
+    const result = await deleteRecurringSchedule(scheduleId);
+    if (!result.success) {
+      return JSON.stringify({ error: result.error });
+    }
+
+    // SMS: recurring cancelled
+    if (client && schedule) {
+      await this.trySendSms(
+        client.phone,
+        `Your recurring ${DAY_NAMES[schedule.dayOfWeek]} at ${schedule.startTime} session has been cancelled. Please reach out if you'd like to reschedule.`
+      );
+    }
+
+    return JSON.stringify({ success: true, message: `Deleted recurring schedule #${scheduleId} and cancelled future appointments.` });
+  }
+
+  private async toolSkipRecurring(
+    clientName: string,
+    scheduleId: number,
+    fromDate: string,
+    weeks: number
+  ): Promise<string> {
+    const { client: matched, error } = this.resolveClient(clientName);
+    if (error) return JSON.stringify({ error });
+
+    const result = await skipRecurringInstance(matched!.id, scheduleId, fromDate, weeks);
+    if (!result.success) {
+      return JSON.stringify({ error: result.error });
+    }
+
+    // SMS: per skipped week -- use cancelledStartTimes from the result directly (no re-query)
+    for (const startTime of result.cancelledStartTimes) {
+      const localStart = utcToLocal(startTime);
+      await this.trySendSms(
+        matched!.phone,
+        `Your session on ${localStart.slice(0, 10)} has been cancelled. Your recurring schedule continues as normal after that.`
+      );
+    }
+
+    return JSON.stringify({
+      success: true,
+      skipped: result.skipped,
+      message: `Skipped ${result.skipped} week(s) for ${matched!.name}.`,
+    });
+  }
+
+  private async toolSetAvailability(
+    rules: Array<{ dayOfWeek: number; startTime: string; endTime: string }>
+  ): Promise<string> {
+    const result = await setAvailability(rules);
+    if (!result.success) {
+      return JSON.stringify({ error: result.error });
+    }
+
+    const summary = rules.map((r) => `${DAY_NAMES[r.dayOfWeek]} ${r.startTime}-${r.endTime}`).join(", ");
+    let msg = `Availability set: ${summary}.`;
+
+    if (result.cancelledAppointments.length > 0) {
+      const cancelled = result.cancelledAppointments
+        .map((c) => `${c.clientName} on ${c.startTime.slice(0, 10)} at ${c.startTime.slice(11, 16)}`)
+        .join(", ");
+      msg += ` Cancelled ${result.cancelledAppointments.length} appointment(s): ${cancelled}. Affected clients have been notified.`;
+    }
+
+    return JSON.stringify({ success: true, message: msg });
+  }
+
+  private async toolListAvailability(): Promise<string> {
+    const result = await listAvailability();
+
+    return JSON.stringify({
+      recurring: result.recurring.map((r) => ({
+        id: r.id,
+        day: r.dayOfWeek !== null ? DAY_NAMES[r.dayOfWeek] : null,
+        startTime: r.startTime,
+        endTime: r.endTime,
+      })),
+      overrides: result.overrides.map((o) => ({
+        id: o.id,
+        date: o.overrideDate,
+        startTime: o.startTime,
+        endTime: o.endTime,
+      })),
+      blocks: result.blocks.map((b) => ({
+        id: b.id,
+        date: b.overrideDate,
+        day: b.dayOfWeek !== null ? DAY_NAMES[b.dayOfWeek] : null,
+        startTime: b.startTime,
+        endTime: b.endTime,
+      })),
+    });
+  }
+
+  private async toolOverrideAvailability(
+    date: string,
+    startTime: string,
+    endTime: string
+  ): Promise<string> {
+    const result = await overrideAvailability(date, startTime, endTime);
+    if (!result.success) {
+      return JSON.stringify({ error: result.error });
+    }
+
+    let msg = `Set availability override for ${date}: ${startTime}-${endTime}.`;
+    if (result.cancelledAppointments.length > 0) {
+      const cancelled = result.cancelledAppointments
+        .map((c) => `${c.clientName} at ${c.startTime.slice(11, 16)}`)
+        .join(", ");
+      msg += ` Cancelled ${result.cancelledAppointments.length} appointment(s): ${cancelled}. Affected clients have been notified.`;
+    }
+
+    return JSON.stringify({ success: true, message: msg });
+  }
+
+  private async toolRemoveBlock(blockId: number): Promise<string> {
+    const result = await removeBlock(blockId);
+    if (!result.success) {
+      return JSON.stringify({ error: result.error });
+    }
+    return JSON.stringify({ success: true, message: `Removed block #${blockId}. That time is now open for bookings.` });
+  }
+
+  private async toolListClients(search?: string): Promise<string> {
+    const result = await listClients(search);
+    return JSON.stringify({
+      count: result.length,
+      clients: result.map((c) => ({
+        id: c.id,
+        name: c.name,
+        phone: c.phone,
+        email: c.email,
+        packageType: c.packageType,
+        sessionsRemaining: c.sessionsRemaining,
+      })),
+    });
+  }
+
+  private async toolUpdateClient(
+    clientName: string,
+    name?: string,
+    phone?: string,
+    email?: string,
+    notes?: string
+  ): Promise<string> {
+    const { client: matched, error } = this.resolveClient(clientName, { includeInactive: true });
+    if (error) return JSON.stringify({ error });
+
+    const result = await updateClient(matched!.id, { name, phone, email, notes });
+    if (!result.success) {
+      return JSON.stringify({ error: result.error });
+    }
+    return JSON.stringify({ success: true, message: `Updated ${matched!.name}'s details.` });
+  }
+
+  private async toolReactivateClient(clientName: string): Promise<string> {
+    // Search all clients including inactive
+    const { client: matched, error } = this.resolveClient(clientName, { includeInactive: true });
+    if (error) return JSON.stringify({ error });
+
+    const result = await reactivateClient(matched!.id);
+    if (!result.success) {
+      return JSON.stringify({ error: result.error });
+    }
+
+    // SMS: welcome back
+    await this.trySendSms(matched!.phone, `You've been reactivated! Reply to this number to book sessions.`);
+
+    return JSON.stringify({ success: true, message: `Reactivated ${matched!.name}.` });
+  }
+
+  private async toolDeleteClient(clientName: string): Promise<string> {
+    const { client: matched, error } = this.resolveClient(clientName, { includeInactive: true });
+    if (error) return JSON.stringify({ error });
+
+    // Send farewell SMS BEFORE deleting (phone number lives on client record)
+    await this.trySendSms(
+      matched!.phone,
+      `Your account has been removed. Thank you for training with us.`
+    );
+
+    const result = await deleteClient(matched!.id);
+    if (!result.success) {
+      return JSON.stringify({ error: result.error });
+    }
+
+    return JSON.stringify({
+      success: true,
+      message: `Permanently deleted ${matched!.name} and all their data (appointments, recurring schedules, session history, messages).`,
+    });
+  }
+
+  private async toolDailySummary(): Promise<string> {
+    const result = await getDailySummary();
+    return JSON.stringify({
+      today: todayLocal(),
+      appointmentCount: result.todayCount,
+      upcoming: result.upcoming,
+      lowBalanceClients: result.lowBalanceClients,
+    });
+  }
+
+  private async toolWeeklySummary(weekStart?: string): Promise<string> {
+    const result = await getWeeklySummary(weekStart);
+    return JSON.stringify({
+      totalAppointments: result.totalCount,
+      days: result.days,
+    });
+  }
+
+  private async toolSendMessage(clientName: string, body: string): Promise<string> {
+    const { client: matched, error } = this.resolveClient(clientName);
+    if (error) return JSON.stringify({ error });
+
+    const result = await sendMessageToClient(matched!.id, body);
+    if (!result.success) {
+      return JSON.stringify({ error: result.error });
+    }
+
+    return JSON.stringify({ success: true, message: `Message sent to ${matched!.name}.` });
   }
 }
 

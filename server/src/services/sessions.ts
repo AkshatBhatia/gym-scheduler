@@ -8,7 +8,8 @@ import { generateForClient } from "./recurring.js";
  */
 export async function decrementSession(
   clientId: number,
-  appointmentId: number
+  appointmentId: number,
+  reason: string = "Session completed"
 ): Promise<{ success: boolean; newBalance: number; error?: string }> {
   const client = db
     .select()
@@ -21,7 +22,7 @@ export async function decrementSession(
   }
 
   const currentBalance = client.sessionsRemaining ?? 0;
-  const newBalance = Math.max(0, currentBalance - 1);
+  const newBalance = currentBalance - 1;
 
   // Update client balance
   db.update(clients)
@@ -39,7 +40,7 @@ export async function decrementSession(
       appointmentId,
       changeAmount: -1,
       balanceAfter: newBalance,
-      reason: "Session completed",
+      reason,
     })
     .run();
 

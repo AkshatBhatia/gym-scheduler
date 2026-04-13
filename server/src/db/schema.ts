@@ -76,6 +76,7 @@ export const recurringSchedules = sqliteTable("recurring_schedules", {
   dayOfWeek: integer("day_of_week").notNull(), // 0=Sunday, 6=Saturday
   startTime: text("start_time").notNull(), // HH:MM
   endTime: text("end_time").notNull(), // HH:MM
+  endDate: text("end_date"), // YYYY-MM-DD, nullable (null = no end)
   active: integer("active").default(1),
   notes: text("notes"),
   createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`),

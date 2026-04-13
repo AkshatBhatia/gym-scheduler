@@ -340,7 +340,8 @@ router.put("/:id/status", async (req: Request, res: Response) => {
   }
 });
 
-// DELETE /api/appointments/:id — permanently delete an appointment
+// DELETE /api/appointments/:id — delete appointment(s)
+// Query param ?scope=single (default) | all_future | entire_series
 router.delete("/:id", (req: Request, res: Response) => {
   try {
     const id = parseInt(String(req.params.id), 10);
@@ -360,8 +361,42 @@ router.delete("/:id", (req: Request, res: Response) => {
       return;
     }
 
-    db.delete(appointments).where(eq(appointments.id, id)).run();
-    res.json({ message: "Appointment deleted" });
+    const scope = (req.query.scope as string) || "single";
+    let deleted = 0;
+
+    if (scope === "single" || !existing.recurringScheduleId) {
+      db.delete(appointments).where(eq(appointments.id, id)).run();
+      deleted = 1;
+    } else if (scope === "all_future") {
+      // Delete this and all future appointments in the same series
+      const future = db
+        .select()
+        .from(appointments)
+        .where(
+          and(
+            eq(appointments.recurringScheduleId, existing.recurringScheduleId),
+            gte(appointments.startTime, existing.startTime)
+          )
+        )
+        .all();
+      for (const appt of future) {
+        db.delete(appointments).where(eq(appointments.id, appt.id)).run();
+      }
+      deleted = future.length;
+    } else if (scope === "entire_series") {
+      // Delete ALL appointments in this recurring series
+      const series = db
+        .select()
+        .from(appointments)
+        .where(eq(appointments.recurringScheduleId, existing.recurringScheduleId))
+        .all();
+      for (const appt of series) {
+        db.delete(appointments).where(eq(appointments.id, appt.id)).run();
+      }
+      deleted = series.length;
+    }
+
+    res.json({ message: `Deleted ${deleted} appointment(s)`, deleted });
   } catch (error) {
     console.error("Error deleting appointment:", error);
     res.status(500).json({ error: "Failed to delete appointment" });

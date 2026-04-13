@@ -68,7 +68,8 @@ export default function Schedule() {
   });
 
   const deleteMutation = useMutation({
-    mutationFn: (id: number) => deleteAppointment(id),
+    mutationFn: ({ id, scope }: { id: number; scope: 'single' | 'all_future' | 'entire_series' }) =>
+      deleteAppointment(id, scope),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['week-appointments'] });
       setSelected(null);
@@ -183,6 +184,9 @@ export default function Schedule() {
                         onClick={() => setSelected(appt)}
                         className={`flex-1 w-full truncate rounded-md border px-2 py-2 text-left text-xs font-medium transition-shadow hover:shadow-md ${STATUS_BG[appt.status]}`}
                       >
+                        {appt.recurringScheduleId && (
+                          <span className="mr-1 opacity-50" title="Recurring">&#x21bb;</span>
+                        )}
                         {appt.clientName ?? `Client #${appt.clientId}`}
                         <span className="ml-1 opacity-60">
                           {format(parseISO(appt.startTime), 'h:mm')}
@@ -235,6 +239,17 @@ export default function Schedule() {
                 <span className="text-sm text-gray-500">Status</span>
                 <StatusBadge status={selected.status} />
               </div>
+              {selected.recurringScheduleId && (
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-gray-500">Type</span>
+                  <span className="inline-flex items-center gap-1 rounded-full bg-purple-100 px-2.5 py-0.5 text-xs font-medium text-purple-700">
+                    <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                    </svg>
+                    Recurring
+                  </span>
+                </div>
+              )}
               {selected.notes && (
                 <div>
                   <span className="text-sm text-gray-500">Notes</span>
@@ -268,17 +283,46 @@ export default function Schedule() {
             </div>
 
             <div className="border-t border-gray-200 pt-4">
-              <button
-                onClick={() => {
-                  if (confirm('Permanently delete this appointment? This cannot be undone.')) {
-                    deleteMutation.mutate(selected.id);
-                  }
-                }}
-                disabled={deleteMutation.isPending}
-                className="rounded-lg border border-red-300 px-4 py-2 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-40"
-              >
-                {deleteMutation.isPending ? 'Deleting...' : 'Delete Appointment'}
-              </button>
+              <p className="mb-2 text-sm font-medium text-gray-700">Delete:</p>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={() => {
+                    if (confirm('Delete this appointment?')) {
+                      deleteMutation.mutate({ id: selected.id, scope: 'single' });
+                    }
+                  }}
+                  disabled={deleteMutation.isPending}
+                  className="rounded-lg border border-red-300 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-40"
+                >
+                  This one
+                </button>
+                {selected.recurringScheduleId && (
+                  <>
+                    <button
+                      onClick={() => {
+                        if (confirm('Delete this and all future appointments in this series?')) {
+                          deleteMutation.mutate({ id: selected.id, scope: 'all_future' });
+                        }
+                      }}
+                      disabled={deleteMutation.isPending}
+                      className="rounded-lg border border-red-300 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-40"
+                    >
+                      This & future
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (confirm('Delete ALL appointments in this recurring series?')) {
+                          deleteMutation.mutate({ id: selected.id, scope: 'entire_series' });
+                        }
+                      }}
+                      disabled={deleteMutation.isPending}
+                      className="rounded-lg border border-red-300 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-40"
+                    >
+                      Entire series
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
           </div>
         )}

@@ -99,6 +99,16 @@ export function nowUTC(): string {
 }
 
 /**
+ * Format a Date object as YYYY-MM-DD string.
+ */
+export function formatDateYMD(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+/**
  * Build a UTC datetime from a local date (YYYY-MM-DD) and local time (HH:MM).
  * This is what we use when the instructor says "book at 3pm on Tuesday".
  */

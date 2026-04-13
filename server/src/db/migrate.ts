@@ -79,6 +79,7 @@ export function runMigrations(dbPath?: string) {
       day_of_week INTEGER NOT NULL,
       start_time TEXT NOT NULL,
       end_time TEXT NOT NULL,
+      end_date TEXT,
       active INTEGER DEFAULT 1,
       notes TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -123,6 +124,10 @@ export function runMigrations(dbPath?: string) {
 
     INSERT OR IGNORE INTO settings (key, value) VALUES ('timezone', 'America/Los_Angeles');
   `);
+
+  // Safe column additions for existing databases
+  try { db.exec("ALTER TABLE recurring_schedules ADD COLUMN end_date TEXT"); } catch {}
+
 
   console.log("[DB] Migrations complete — all tables ready");
   db.close();

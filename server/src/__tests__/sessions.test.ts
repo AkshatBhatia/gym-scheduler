@@ -179,16 +179,16 @@ describe("decrementSession", () => {
     expect(ledger[0].reason).toBe("Session completed");
   });
 
-  it("clamps balance to 0 when already at 0", async () => {
+  it("allows balance to go negative when already at 0", async () => {
     const client = insertClient({ sessionsRemaining: 0 });
     const appt = insertAppointment(client.id);
     const result = await decrementSession(client.id, appt.id);
 
     expect(result.success).toBe(true);
-    expect(result.newBalance).toBe(0);
+    expect(result.newBalance).toBe(-1);
   });
 
-  it("treats null sessionsRemaining as 0 and clamps", async () => {
+  it("treats null sessionsRemaining as 0 and goes negative", async () => {
     const client = insertClient({
       sessionsRemaining: null as unknown as number,
     });
@@ -196,7 +196,7 @@ describe("decrementSession", () => {
     const result = await decrementSession(client.id, appt.id);
 
     expect(result.success).toBe(true);
-    expect(result.newBalance).toBe(0);
+    expect(result.newBalance).toBe(-1);
   });
 
   it("returns error for nonexistent client", async () => {

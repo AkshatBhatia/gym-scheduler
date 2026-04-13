@@ -24,6 +24,7 @@ vi.mock("../services/timezone.js", () => ({
   todayLocal: () => new Date().toISOString().slice(0, 10),
   formatLocalTimeShort: (iso: string) => iso,
   localDateTimeToUTC: (date: string, time: string) => new Date(`${date}T${time}:00Z`).toISOString(),
+  formatDateYMD: (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`,
 }));
 
 // Now import services (they'll use mocked db)

@@ -107,6 +107,7 @@ vi.mock("../services/timezone.js", () => ({
     // Fixed "today" so tests are reproducible
     return "2026-04-12";
   },
+  formatDateYMD: (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`,
 }));
 
 // Import AFTER mocks
@@ -189,43 +190,43 @@ function countAppointments(clientId: number) {
 // ---------------------------------------------------------------------------
 // generateForClient
 // ---------------------------------------------------------------------------
-describe("generateForClient", () => {
+describe("generateForClient (indefinite, 12-week horizon)", () => {
   beforeEach(() => {
     testDb = createTestDb();
     phoneSeq = 0;
+    // Set up availability Mon-Sat 06:00-18:00 (Sun is off)
+    for (let day = 0; day <= 6; day++) {
+      insertAvailability({ dayOfWeek: day, startTime: "06:00", endTime: "18:00", isBlocked: 0 });
+    }
   });
 
-  it("generates the correct number of appointments based on sessionsRemaining", async () => {
+  it("generates 12 weeks of appointments for a single schedule", async () => {
     const client = insertClient({ sessionsRemaining: 3 });
-    // Schedule on Monday (dayOfWeek=1). "Today" is 2026-04-12 (Sunday),
-    // so the next Monday is 2026-04-13. With 3 sessions and 1 schedule,
-    // we expect 3 appointments on consecutive Mondays.
     insertSchedule(client.id, { dayOfWeek: 1 });
 
     const result = await generateForClient(client.id);
 
-    expect(result.created).toBe(3);
-    expect(countAppointments(client.id)).toBe(3);
+    // 12-week horizon, 1 schedule = 12 appointments (not limited by sessions)
+    expect(result.created).toBe(12);
+    expect(countAppointments(client.id)).toBe(12);
   });
 
-  it("distributes appointments across multiple schedules", async () => {
+  it("generates 12 weeks per schedule across multiple schedules", async () => {
     const client = insertClient({ sessionsRemaining: 4 });
-    // Monday and Wednesday schedules
     insertSchedule(client.id, { dayOfWeek: 1, startTime: "09:00", endTime: "10:00" });
     insertSchedule(client.id, { dayOfWeek: 3, startTime: "11:00", endTime: "12:00" });
 
     const result = await generateForClient(client.id);
 
-    // 4 sessions spread across 2 weekly slots
-    expect(result.created).toBe(4);
-    expect(countAppointments(client.id)).toBe(4);
+    // 2 schedules x 12 weeks = 24
+    expect(result.created).toBe(24);
+    expect(countAppointments(client.id)).toBe(24);
   });
 
   it("skips days blocked by a date-specific availability block", async () => {
     const client = insertClient({ sessionsRemaining: 2 });
     insertSchedule(client.id, { dayOfWeek: 1, startTime: "09:00", endTime: "10:00" });
 
-    // Block the first Monday (2026-04-13) with a date-specific block
     insertAvailability({
       overrideDate: "2026-04-13",
       startTime: "08:00",
@@ -235,17 +236,15 @@ describe("generateForClient", () => {
 
     const result = await generateForClient(client.id);
 
-    // First Monday skipped, so we fill from week 2 onward
     expect(result.skipped).toBeGreaterThanOrEqual(1);
-    // Still creates the 2 needed appointments on later weeks
-    expect(result.created).toBe(2);
+    // 12 weeks minus 1 blocked = 11
+    expect(result.created).toBe(11);
   });
 
   it("skips days blocked by a recurring day-of-week block", async () => {
     const client = insertClient({ sessionsRemaining: 2 });
     insertSchedule(client.id, { dayOfWeek: 1, startTime: "09:00", endTime: "10:00" });
 
-    // Recurring block on all Mondays at the same time
     insertAvailability({
       dayOfWeek: 1,
       startTime: "08:00",
@@ -255,75 +254,57 @@ describe("generateForClient", () => {
 
     const result = await generateForClient(client.id);
 
-    // All Mondays are blocked so nothing can be created
     expect(result.created).toBe(0);
     expect(result.skipped).toBeGreaterThan(0);
   });
 
-  it("skips dates in the past", async () => {
-    // "Today" is 2026-04-12 (Sunday). dayOfWeek=0 is Sunday.
-    // Week 0 Sunday = today (2026-04-12), which should NOT be skipped since it equals today.
-    // But if we pick a day already past in this week (e.g., Saturday = 6 is 2026-04-18, which is future).
-    // We instead test with an already-past scenario by using a day earlier in the week.
-    // Actually, today is Sunday. dayOfWeek=6 (Saturday) in week 0 = 2026-04-18 (future).
-    // The only past day is if daysUntil < 0 in week 0. Since today is Sunday (0), any dayOfWeek > 0 is future.
-    // dayOfWeek=0 in week 0 = today itself. Let's just verify that week 0 for today works
-    // and that the function doesn't create appointments for dates before today.
+  it("generates for today if schedule matches today's day", async () => {
+    // "Today" is 2026-04-12 (Sunday, day 0)
     const client = insertClient({ sessionsRemaining: 1 });
-    insertSchedule(client.id, { dayOfWeek: 0 }); // Sunday = today
+    insertSchedule(client.id, { dayOfWeek: 0 }); // Sunday
 
     const result = await generateForClient(client.id);
 
-    // Today (Sunday) should be generated since targetDate >= today
-    expect(result.created).toBe(1);
+    // Should generate for today + 11 more Sundays = 12
+    expect(result.created).toBe(12);
   });
 
-  it("returns 0 created when sessionsRemaining is 0", async () => {
+  it("generates even when sessionsRemaining is 0 (holds calendar slot)", async () => {
     const client = insertClient({ sessionsRemaining: 0 });
     insertSchedule(client.id, { dayOfWeek: 1 });
 
     const result = await generateForClient(client.id);
 
-    expect(result.created).toBe(0);
-    expect(result.skipped).toBe(0);
+    // Indefinite: still generates 12 weeks
+    expect(result.created).toBe(12);
   });
 
-  it("generates up to 12 weeks of appointments for monthly clients", async () => {
-    const client = insertClient({
-      sessionsRemaining: 0,
-      packageType: "monthly",
-    });
-    insertSchedule(client.id, { dayOfWeek: 1 }); // 1 slot per week
+  it("generates 12 weeks regardless of package type", async () => {
+    const client = insertClient({ sessionsRemaining: 0, packageType: "monthly" });
+    insertSchedule(client.id, { dayOfWeek: 1 });
 
     const result = await generateForClient(client.id);
 
-    // Monthly: 12 weeks * 1 schedule = 12 slots
     expect(result.created).toBe(12);
     expect(countAppointments(client.id)).toBe(12);
   });
 
-  it("counts existing future confirmed appointments toward the slot budget", async () => {
+  it("does not double-create if appointments already exist at those times", async () => {
     const client = insertClient({ sessionsRemaining: 3 });
     insertSchedule(client.id, { dayOfWeek: 1, startTime: "09:00", endTime: "10:00" });
 
-    // Pre-insert 2 future confirmed appointments (at different times so no duplicate skip)
+    // Pre-insert an appointment at the first Monday's recurring slot
     insertAppointment(client.id, {
-      startTime: "2026-05-01T14:00:00.000Z",
-      endTime: "2026-05-01T15:00:00.000Z",
-      status: "confirmed",
-    });
-    insertAppointment(client.id, {
-      startTime: "2026-05-08T14:00:00.000Z",
-      endTime: "2026-05-08T15:00:00.000Z",
+      startTime: "2026-04-13T09:00:00.000Z",
+      endTime: "2026-04-13T10:00:00.000Z",
       status: "confirmed",
     });
 
     const result = await generateForClient(client.id);
 
-    // 3 sessions - 2 already booked = 1 new slot to fill
-    expect(result.created).toBe(1);
-    // Total appointments = 2 pre-existing + 1 new
-    expect(countAppointments(client.id)).toBe(3);
+    // 12 weeks - 1 existing = 11 new
+    expect(result.created).toBe(11);
+    expect(countAppointments(client.id)).toBe(12); // 1 pre-existing + 11 new
   });
 
   it("returns { created: 0, skipped: 0 } for nonexistent client", async () => {
@@ -341,9 +322,12 @@ describe("generateAllRecurring", () => {
   beforeEach(() => {
     testDb = createTestDb();
     phoneSeq = 0;
+    for (let day = 0; day <= 6; day++) {
+      insertAvailability({ dayOfWeek: day, startTime: "06:00", endTime: "18:00", isBlocked: 0 });
+    }
   });
 
-  it("calls generateForClient for each unique client with active schedules", async () => {
+  it("generates for each unique client with active schedules", async () => {
     const clientA = insertClient({ sessionsRemaining: 2, name: "A" });
     const clientB = insertClient({ sessionsRemaining: 1, name: "B" });
 
@@ -352,22 +336,21 @@ describe("generateAllRecurring", () => {
 
     const result = await generateAllRecurring();
 
-    // clientA gets 2 appointments, clientB gets 1
-    expect(result.created).toBe(3);
-    expect(countAppointments(clientA.id)).toBe(2);
-    expect(countAppointments(clientB.id)).toBe(1);
+    // Both get 12 weeks each
+    expect(result.created).toBe(24);
+    expect(countAppointments(clientA.id)).toBe(12);
+    expect(countAppointments(clientB.id)).toBe(12);
   });
 
   it("deduplicates clients that have multiple active schedules", async () => {
     const client = insertClient({ sessionsRemaining: 4 });
-    // Same client, two different day schedules
     insertSchedule(client.id, { dayOfWeek: 1 });
     insertSchedule(client.id, { dayOfWeek: 3 });
 
     const result = await generateAllRecurring();
 
-    // generateForClient should be called once, producing 4 appointments
-    expect(result.created).toBe(4);
-    expect(countAppointments(client.id)).toBe(4);
+    // 2 schedules x 12 weeks = 24
+    expect(result.created).toBe(24);
+    expect(countAppointments(client.id)).toBe(24);
   });
 });

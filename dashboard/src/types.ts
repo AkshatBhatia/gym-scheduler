@@ -18,6 +18,7 @@ export interface Appointment {
   startTime: string;
   endTime: string;
   status: 'confirmed' | 'cancelled' | 'no-show' | 'completed';
+  recurringScheduleId?: number | null;
   notes?: string;
   createdAt: string;
 }

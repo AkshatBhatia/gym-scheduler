@@ -56,8 +56,8 @@ export async function verifyOTP(
 ): Promise<{ success: boolean; token?: string; instructor?: any; isNewUser?: boolean; error?: string }> {
   const now = new Date().toISOString();
 
-  // Dev bypass: accept "12345" as a valid OTP in non-production
-  const isDevBypass = process.env.NODE_ENV !== "production" && code === "12345";
+  // Dev bypass: accept "123456" as a valid OTP in non-production
+  const isDevBypass = process.env.NODE_ENV !== "production" && code === "123456";
 
   // Find a valid, unused OTP for this phone
   const otp = isDevBypass

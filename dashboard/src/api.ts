@@ -94,8 +94,11 @@ export function updateAppointmentStatus(
   });
 }
 
-export function deleteAppointment(id: number): Promise<void> {
-  return request(`/appointments/${id}`, { method: 'DELETE' });
+export function deleteAppointment(
+  id: number,
+  scope: 'single' | 'all_future' | 'entire_series' = 'single'
+): Promise<{ message: string; deleted: number }> {
+  return request(`/appointments/${id}?scope=${scope}`, { method: 'DELETE' });
 }
 
 // ── Availability ─────────────────────────────────────────

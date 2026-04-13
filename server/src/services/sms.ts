@@ -58,3 +58,10 @@ function createSmsProvider(): SmsProvider {
 }
 
 export const smsProvider = createSmsProvider();
+
+/**
+ * Convenience wrapper for sending SMS. Tests mock this named export.
+ */
+export async function sendSms(to: string, body: string): Promise<{ sid: string }> {
+  return smsProvider.sendMessage(to, body);
+}

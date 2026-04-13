@@ -5,8 +5,8 @@ import { getAvailability, createAvailability, deleteAvailability } from '../api'
 import type { AvailabilityRule } from '../types';
 
 const DAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-const DISPLAY_DAYS = [1, 2, 3, 4, 5, 6]; // Mon-Sat
-const HOURS = Array.from({ length: 13 }, (_, i) => i + 6); // 6am - 6pm
+const DISPLAY_DAYS = [1, 2, 3, 4, 5, 6, 0]; // Mon-Sat, Sun
+const HOURS = Array.from({ length: 24 }, (_, i) => i); // full 24 hours
 
 export default function Availability() {
   const queryClient = useQueryClient();
@@ -159,7 +159,7 @@ export default function Availability() {
         ) : (
           <div className="min-w-[700px]">
             {/* Day headers */}
-            <div className="grid grid-cols-[80px_repeat(6,1fr)] border-b border-gray-200">
+            <div className="grid grid-cols-[80px_repeat(7,1fr)] border-b border-gray-200">
               <div className="border-r border-gray-200 p-2" />
               {DISPLAY_DAYS.map((d) => (
                 <div
@@ -175,7 +175,7 @@ export default function Availability() {
             {HOURS.map((hour) => (
               <div
                 key={hour}
-                className="grid grid-cols-[80px_repeat(6,1fr)] border-b border-gray-100 last:border-b-0"
+                className="grid grid-cols-[80px_repeat(7,1fr)] border-b border-gray-100 last:border-b-0"
               >
                 <div className="flex items-center justify-end border-r border-gray-200 p-2 text-xs font-medium text-gray-400">
                   {format(new Date(2000, 0, 1, hour), 'h a')}
